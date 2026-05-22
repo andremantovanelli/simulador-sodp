@@ -468,8 +468,17 @@ with aba_saidas:
             tipos_vis = st.multiselect("Tipo", ["realizado","reforecast","previsao"],
                                        default=["realizado","reforecast","previsao"], key='sai_tipo')
 
+        params_vis = get_params()
+        data_ini_vis = params_vis.get('data_ini_vis', date(2025, 5, 1))
+        data_fim_vis = params_vis.get('data_fim_vis', date(2025, 7, 30))
+
         cal_f = filtrar_cd(cal)
-        cal_f = cal_f[cal_f['gerencia'].isin(sel_ger) & cal_f['categoria'].isin(sel_cat)]
+        cal_f = cal_f[
+            (cal_f['data_inicio'].dt.date <= data_fim_vis) &
+            (cal_f['data_fim'].dt.date    >= data_ini_vis) &
+            cal_f['gerencia'].isin(sel_ger) &
+            cal_f['categoria'].isin(sel_cat)
+        ]
 
         with st.spinner("Calculando saídas..."):
             df_sai = calcular_saidas(cal_f, vendas, data_ref, params, ajustes)
@@ -535,7 +544,15 @@ with aba_blocado:
         st.info("Carregue o calendário na aba Dados.")
     else:
         cal = st.session_state['cal']
+        params_vis2 = get_params()
+        data_ini_vis2 = params_vis2.get('data_ini_vis', date(2025, 5, 1))
+        data_fim_vis2 = params_vis2.get('data_fim_vis', date(2025, 7, 30))
+
         cal_f = filtrar_cd(cal)
+        cal_f = cal_f[
+            (cal_f['data_inicio'].dt.date <= data_fim_vis2) &
+            (cal_f['data_fim'].dt.date    >= data_ini_vis2)
+        ]
 
         col_f1, col_f2 = st.columns(2)
         with col_f1:
@@ -599,7 +616,14 @@ with aba_reforecast:
             try: vendas = carregar_vendas(arq_vend)
             except: pass
 
+        params_vis3 = get_params()
+        data_ini_vis3 = params_vis3.get('data_ini_vis', date(2025, 5, 1))
+        data_fim_vis3 = params_vis3.get('data_fim_vis', date(2025, 7, 30))
         cal_f = filtrar_cd(cal)
+        cal_f = cal_f[
+            (cal_f['data_inicio'].dt.date <= data_fim_vis3) &
+            (cal_f['data_fim'].dt.date    >= data_ini_vis3)
+        ]
         df_sai_rf = calcular_saidas(cal_f, vendas, data_ref, params, ajustes)
 
         if df_sai_rf.empty:
@@ -644,64 +668,87 @@ with aba_sim:
         st.info("Carregue o calendário na aba Dados.")
     else:
         cal = st.session_state['cal']
+        params = get_params()
+        data_ini_vis = params.get('data_ini_vis', date(2025, 5, 1))
+        data_fim_vis = params.get('data_fim_vis', date(2025, 7, 30))
+
         st.caption("Ajustes aqui são efêmeros — não afetam as bases originais. Use 'Resetar' para voltar ao estado original.")
 
         if st.button("Resetar todas as simulações"):
             st.session_state['ajustes'] = {}
             st.rerun()
 
-        camp_ids  = cal['id_campanha'].tolist()
-        camp_nomes = cal.set_index('id_campanha')['campanha'].to_dict()
-        opcoes = [f"{cid} — {camp_nomes.get(cid,'')}" for cid in camp_ids]
-        sel_str = st.selectbox("Selecionar campanha para ajustar", opcoes)
-        cid_sel = int(sel_str.split(' — ')[0])
-        camp_row = cal[cal['id_campanha'] == cid_sel].iloc[0]
-        aj_atual = st.session_state['ajustes'].get(cid_sel, {})
+        # Filtra campanhas no horizonte de visualização
+        cal_sim = cal[
+            (cal['data_inicio'].dt.date <= data_fim_vis) &
+            (cal['data_fim'].dt.date    >= data_ini_vis)
+        ].copy()
 
-        st.markdown(f"**{camp_row['campanha']}** — {camp_row['categoria']} | CD: {camp_row.get('cd','')}")
+        if cal_sim.empty:
+            st.warning("Nenhuma campanha no período de visualização configurado.")
+        else:
+            camp_nomes = cal_sim.set_index('id_campanha')['campanha'].to_dict()
+            opcoes     = [f"{row['campanha']} (ID {row['id_campanha']})"
+                          for _, row in cal_sim.iterrows()]
+            idx_map    = {f"{row['campanha']} (ID {row['id_campanha']})": row['id_campanha']
+                          for _, row in cal_sim.iterrows()}
 
-        col1, col2 = st.columns(2)
-        with col1:
-            new_ini = st.date_input("Data início",
-                value=aj_atual.get('data_inicio', camp_row['data_inicio'].date()), key=f'ini_{cid_sel}')
-            new_fim = st.date_input("Data fim",
-                value=aj_atual.get('data_fim', camp_row['data_fim'].date()), key=f'fim_{cid_sel}')
-            new_est = st.number_input("Estoque total (peças)",
-                value=float(aj_atual.get('estoque_total', camp_row['estoque_total'])),
-                min_value=0.0, step=100.0, key=f'est_{cid_sel}')
-        with col2:
-            feriados_sim = get_feriados_set(camp_row.get('cd','Extrema'))
-            dn_calc, do_calc = calcular_datas_blocado(new_ini, new_fim, feriados_sim)
-            new_dn = st.date_input("Data descida (blocado)",
-                value=aj_atual.get('dn', dn_calc), key=f'dn_{cid_sel}')
-            new_do = st.date_input("Data subida (blocado)",
-                value=aj_atual.get('do', do_calc), key=f'do_{cid_sel}')
-            new_prev = st.number_input("Previsão de vendas (peças)",
-                value=float(aj_atual.get('previsao_pecas', camp_row['previsao_pecas'])),
-                min_value=0.0, step=100.0, key=f'prev_{cid_sel}')
+            sel_str = st.selectbox("Selecionar campanha para ajustar", opcoes)
+            if sel_str:
+                cid_sel  = idx_map[sel_str]
+                camp_row = cal_sim[cal_sim['id_campanha'] == cid_sel].iloc[0]
+                aj_atual = st.session_state['ajustes'].get(cid_sel, {})
 
-        if st.button("Aplicar ajuste"):
-            st.session_state['ajustes'][cid_sel] = {
-                'data_inicio':   new_ini,
-                'data_fim':      new_fim,
-                'estoque_total': new_est,
-                'dn':            new_dn,
-                'do':            new_do,
-                'previsao_pecas':new_prev,
-            }
-            st.success(f"Ajuste aplicado para {camp_row['campanha']}. Verifique as abas Saídas e Blocado.")
+                st.markdown(f"**{camp_row['campanha']}** — {camp_row['categoria']} | CD: {camp_row.get('cd','')}")
 
-        if st.session_state['ajustes']:
-            st.subheader("Ajustes ativos")
-            rows = []
-            for cid, aj in st.session_state['ajustes'].items():
-                rows.append({'ID': cid, 'Campanha': camp_nomes.get(cid,''),
-                             'Início': str(aj.get('data_inicio','')),
-                             'Fim': str(aj.get('data_fim','')),
-                             'Estoque': aj.get('estoque_total',''),
-                             'DN': str(aj.get('dn','')),
-                             'DO': str(aj.get('do',''))})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                col1, col2 = st.columns(2)
+                with col1:
+                    new_ini = st.date_input("Data início",
+                        value=aj_atual.get('data_inicio', camp_row['data_inicio'].date()),
+                        key=f'ini_{cid_sel}')
+                    new_fim = st.date_input("Data fim",
+                        value=aj_atual.get('data_fim', camp_row['data_fim'].date()),
+                        key=f'fim_{cid_sel}')
+                    new_est = st.number_input("Estoque total (peças)",
+                        value=float(aj_atual.get('estoque_total', camp_row['estoque_total'])),
+                        min_value=0.0, step=100.0, key=f'est_{cid_sel}')
+                with col2:
+                    feriados_sim = get_feriados_set(camp_row.get('cd', 'Extrema'))
+                    dn_calc, do_calc = calcular_datas_blocado(new_ini, new_fim, feriados_sim)
+                    new_dn = st.date_input("Data descida (blocado)",
+                        value=aj_atual.get('dn', dn_calc), key=f'dn_{cid_sel}')
+                    new_do = st.date_input("Data subida (blocado)",
+                        value=aj_atual.get('do', do_calc), key=f'do_{cid_sel}')
+                    new_prev = st.number_input("Previsão de vendas (peças)",
+                        value=float(aj_atual.get('previsao_pecas', camp_row['previsao_pecas'])),
+                        min_value=0.0, step=100.0, key=f'prev_{cid_sel}')
+
+                if st.button("Aplicar ajuste"):
+                    st.session_state['ajustes'][cid_sel] = {
+                        'data_inicio':    new_ini,
+                        'data_fim':       new_fim,
+                        'estoque_total':  new_est,
+                        'dn':             new_dn,
+                        'do':             new_do,
+                        'previsao_pecas': new_prev,
+                    }
+                    st.success(f"Ajuste aplicado para {camp_row['campanha']}. Verifique as abas Saídas e Blocado.")
+
+            if st.session_state['ajustes']:
+                st.subheader("Ajustes ativos")
+                all_nomes = cal.set_index('id_campanha')['campanha'].to_dict()
+                rows = []
+                for cid, aj in st.session_state['ajustes'].items():
+                    rows.append({
+                        'ID':       cid,
+                        'Campanha': all_nomes.get(cid, ''),
+                        'Início':   str(aj.get('data_inicio', '')),
+                        'Fim':      str(aj.get('data_fim', '')),
+                        'Estoque':  aj.get('estoque_total', ''),
+                        'DN':       str(aj.get('dn', '')),
+                        'DO':       str(aj.get('do', '')),
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ABA PARÂMETROS
@@ -712,38 +759,67 @@ with aba_params:
         st.success("Acesso liberado.")
         params = get_params()
 
-        tab_p1, tab_p2, tab_p3, tab_p4 = st.tabs(["Conversões","Pallets","Lead times","Curva de venda"])
+        # ── Período de visualização ──────────────────────────────────────────
+        st.subheader("Período de visualização")
+        st.caption("Define o horizonte exibido em todas as abas.")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            nova_ini = st.date_input("Data inicial", value=params.get('data_ini_vis', date(2025,5,1)),
+                                     key="p_ini")
+        with col_d2:
+            nova_fim = st.date_input("Data final",   value=params.get('data_fim_vis', date(2025,7,30)),
+                                     key="p_fim")
+        params['data_ini_vis'] = nova_ini
+        params['data_fim_vis'] = nova_fim
 
-        with tab_p1:
-            st.caption("Fatores IN e OUT por categoria")
-            df_conv = st.data_editor(params['conversoes'], use_container_width=True,
-                                     hide_index=True, num_rows="dynamic")
-            params['conversoes'] = df_conv
+        st.divider()
 
-        with tab_p2:
-            st.caption("Peças por palete por categoria")
-            df_pal = st.data_editor(params['pallets'], use_container_width=True,
-                                    hide_index=True, num_rows="dynamic")
-            params['pallets'] = df_pal
+        # ── Conversões ───────────────────────────────────────────────────────
+        st.subheader("Conversões por categoria")
+        st.caption("Fator IN = complexidade de recebimento. Fator OUT = complexidade de expedição.")
+        df_conv = st.data_editor(params['conversoes'], use_container_width=True,
+                                 hide_index=True, num_rows="dynamic", key="p_conv")
+        params['conversoes'] = df_conv
 
-        with tab_p3:
-            st.caption("Lead times globais (dias úteis)")
-            wlt = st.number_input("WLT (Warehouse Lead Time)", value=params['lead_times']['wlt'],
-                                   min_value=0, max_value=10, step=1)
-            dlt = st.number_input("DLT (Delivery Lead Time)",  value=params['lead_times']['dlt'],
-                                   min_value=0, max_value=10, step=1)
-            params['lead_times'] = {'wlt': wlt, 'dlt': dlt}
+        st.divider()
 
-            st.caption("Feriados")
-            df_fer = st.data_editor(params['feriados'], use_container_width=True,
-                                    hide_index=True, num_rows="dynamic")
-            params['feriados'] = df_fer
+        # ── Pallets ──────────────────────────────────────────────────────────
+        st.subheader("Peças por palete")
+        st.caption("Quantidade de peças que cabem num palete, por categoria.")
+        df_pal = st.data_editor(params['pallets'], use_container_width=True,
+                                hide_index=True, num_rows="dynamic", key="p_pal")
+        params['pallets'] = df_pal
 
-        with tab_p4:
-            st.caption("Curva de venda histórica por categoria e webdays")
-            df_curva = st.data_editor(params['curva_venda'], use_container_width=True,
-                                      hide_index=True, num_rows="dynamic")
-            params['curva_venda'] = df_curva
+        st.divider()
+
+        # ── Lead times ───────────────────────────────────────────────────────
+        st.subheader("Lead times (dias úteis)")
+        col_wlt, col_dlt = st.columns(2)
+        with col_wlt:
+            wlt = st.number_input("WLT — Warehouse Lead Time", value=params['lead_times']['wlt'],
+                                   min_value=0, max_value=10, step=1, key="p_wlt")
+        with col_dlt:
+            dlt = st.number_input("DLT — Delivery Lead Time",  value=params['lead_times']['dlt'],
+                                   min_value=0, max_value=10, step=1, key="p_dlt")
+        params['lead_times'] = {'wlt': wlt, 'dlt': dlt}
+
+        st.divider()
+
+        # ── Feriados ─────────────────────────────────────────────────────────
+        st.subheader("Feriados")
+        st.caption("Usados no cálculo das datas de descida e subida do blocado.")
+        df_fer = st.data_editor(params['feriados'], use_container_width=True,
+                                hide_index=True, num_rows="dynamic", key="p_fer")
+        params['feriados'] = df_fer
+
+        st.divider()
+
+        # ── Curva de venda ───────────────────────────────────────────────────
+        st.subheader("Curva de venda ODP")
+        st.caption("Percentual de venda por dia relativo, por categoria e webdays. Soma dos dias deve ser 1.")
+        df_curva = st.data_editor(params['curva_venda'], use_container_width=True,
+                                  hide_index=True, num_rows="dynamic", key="p_curva")
+        params['curva_venda'] = df_curva
 
         st.session_state['params'] = params
 
