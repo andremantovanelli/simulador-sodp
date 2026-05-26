@@ -2,552 +2,472 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from datetime import date, timedelta
-import io, sys, os
+import tempfile, os, sys
 sys.path.insert(0, '/home/claude')
-from odp_parser import (carregar_odp, gerar_serie_blocado,
-                         gerar_serie_saidas, carregar_curvas,
-                         get_curva, FERIADOS)
+from engine import calcular, serie_blocado, serie_saidas, carregar_curvas
 from openpyxl import load_workbook
 
-st.set_page_config(
-    page_title="ODP · Privalia",
-    page_icon="📦",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+st.set_page_config(page_title="ODP · Privalia", page_icon="📦",
+                   layout="wide", initial_sidebar_state="collapsed")
 
-# ── Tema ──────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
-
-html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-.block-container { padding: 1.5rem 2rem 2rem; }
-
-/* tabs */
-[data-baseweb="tab-list"] { gap: 0; border-bottom: 1px solid #e5e7eb; }
-[data-baseweb="tab"] { 
-    font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 500;
-    padding: 10px 18px; color: #6b7280;
-}
-[aria-selected="true"] { color: #111827 !important; border-bottom: 2px solid #111827 !important; }
-
-/* métricas */
-[data-testid="metric-container"] { 
-    background: #f9fafb; border-radius: 10px; padding: 16px 20px;
-    border: 1px solid #f3f4f6;
-}
-[data-testid="stMetricValue"] { font-size: 26px !important; font-weight: 600; }
-[data-testid="stMetricLabel"] { font-size: 12px !important; color: #6b7280; }
-
-/* tabela */
-[data-testid="stDataFrame"] { font-size: 12px; }
-
-/* expander */
-[data-testid="stExpander"] { border: 1px solid #f3f4f6 !important; border-radius: 10px; }
-
-/* badges */
-.badge-on  { background:#dcfce7; color:#166534; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
-.badge-x   { background:#f3f4f6; color:#6b7280; padding:2px 8px; border-radius:4px; font-size:11px; }
-.badge-fut { background:#eff6ff; color:#1d4ed8; padding:2px 8px; border-radius:4px; font-size:11px; }
-.alerta    { background:#fef2f2; color:#991b1b; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
-
-.titulo-sec { font-size: 11px; font-weight: 600; color: #9ca3af; 
-              text-transform: uppercase; letter-spacing: .06em; margin: 20px 0 10px; }
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600&display=swap');
+html,body,[class*="css"]{font-family:'DM Sans',sans-serif;}
+.block-container{padding:1.2rem 2rem 2rem;}
+[data-baseweb="tab-list"]{gap:0;border-bottom:1px solid #e5e7eb;}
+[data-baseweb="tab"]{font-size:13px;font-weight:500;padding:10px 18px;color:#6b7280;}
+[aria-selected="true"]{color:#111827!important;border-bottom:2px solid #111827!important;}
+[data-testid="metric-container"]{background:#f9fafb;border-radius:10px;padding:14px 18px;border:1px solid #f3f4f6;}
+[data-testid="stMetricValue"]{font-size:24px!important;font-weight:600;}
+[data-testid="stMetricLabel"]{font-size:11px!important;color:#6b7280;}
+[data-testid="stExpander"]{border:1px solid #f3f4f6!important;border-radius:10px;}
+.badge-on{background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;}
+.badge-x{background:#f3f4f6;color:#6b7280;padding:2px 8px;border-radius:4px;font-size:11px;}
+.badge-fut{background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:4px;font-size:11px;}
+.badge-aj{background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-size:11px;}
+.sec{font-size:11px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px;}
+div[data-testid="stForm"]{border:1px solid #f3f4f6;border-radius:10px;padding:16px;}
 </style>
 """, unsafe_allow_html=True)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def fmt_n(v, dec=0):
+def fn(v, dec=0):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
-    return f"{v:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{v:,.{dec}f}".replace(",","X").replace(".",",").replace("X",".")
 
-def fmt_pct(v, dec=1):
+def fp(v, dec=1):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
     return f"{v*100:.{dec}f}%"
 
-def cor_desvio(v):
-    if abs(v) < 0.05: return "#16a34a"
-    if abs(v) < 0.15: return "#d97706"
-    return "#dc2626"
+CORES = {'realizado':'#1e3a5f','reforecast':'#3b82f6','previsto':'#bfdbfe'}
 
-CAP_BU = 4200        # pallets capacidade armazenagem BU
-CAP_CHECKIN = 50000  # peças/dia check-in Extrema
-CAP_CHECKOUT = 45000 # peças/dia check-out Extrema
+# ── Session state ─────────────────────────────────────────────────────────────
+for k,v in [('df',None),('curvas',{}),('data_ref',date.today()),
+             ('ajustes',{}),('arquivo_path',None)]:
+    if k not in st.session_state: st.session_state[k] = v
 
-CORES_TIPO = {
-    'realizado': '#1e3a5f',
-    'reforecast': '#3b82f6',
-    'previsto':   '#bfdbfe',
-}
+def reload():
+    if not st.session_state.arquivo_path: return
+    with st.spinner("Recalculando..."):
+        df, curvas, dr = calcular(st.session_state.arquivo_path,
+                                  st.session_state.data_ref,
+                                  st.session_state.ajustes)
+    st.session_state.df     = df
+    st.session_state.curvas = curvas
 
-# ── Carregamento de dados ─────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def carregar(arquivo_bytes, nome_arquivo):
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.xlsm', delete=False) as tmp:
-        tmp.write(arquivo_bytes)
-        tmp_path = tmp.name
-    df = carregar_odp(tmp_path)
-    os.unlink(tmp_path)
-    return df
-
-# ── Estado da sessão ──────────────────────────────────────────────────────────
-if 'df' not in st.session_state:
-    st.session_state.df = None
-if 'data_ref' not in st.session_state:
-    st.session_state.data_ref = date.today()
+def processar(arq_bytes, nome):
+    with tempfile.NamedTemporaryFile(suffix='.xlsm', delete=False) as t:
+        t.write(arq_bytes); path = t.name
+    df, curvas, dr = calcular(path)
+    return df, curvas, dr, path
 
 # ── Header ────────────────────────────────────────────────────────────────────
-col_logo, col_ref, col_up = st.columns([3, 2, 2])
-with col_logo:
-    st.markdown("### ODP &nbsp;·&nbsp; Privalia")
-with col_ref:
+h1, h2, h3 = st.columns([3, 2, 2])
+with h1: st.markdown("### ODP &nbsp;·&nbsp; Privalia")
+with h2:
     if st.session_state.df is not None:
         dr = st.session_state.data_ref
-        st.markdown(f"<span style='font-size:13px;color:#6b7280'>ref. {dr.strftime('%d/%m/%Y')}</span>",
+        st.markdown(f"<div style='padding-top:6px;font-size:13px;color:#6b7280'>ref. {dr.strftime('%d/%m/%Y')}</div>",
                     unsafe_allow_html=True)
-with col_up:
-    uploaded = st.file_uploader("", type=['xlsm','xlsx'], label_visibility='collapsed',
-                                 key='uploader')
-    if uploaded:
+with h3:
+    up = st.file_uploader("", type=['xlsm','xlsx'], label_visibility='collapsed')
+    if up:
         with st.spinner("Lendo simulador..."):
-            df_novo = carregar(uploaded.read(), uploaded.name)
-            st.session_state.df = df_novo
-            if not df_novo.empty:
-                st.session_state.data_ref = df_novo['data_ref'].iloc[0]
+            df_n, curvas_n, dr_n, path_n = processar(up.read(), up.name)
+        st.session_state.df     = df_n
+        st.session_state.curvas = curvas_n
+        st.session_state.data_ref = dr_n
+        st.session_state.arquivo_path = path_n
+        st.session_state.ajustes = {}
         st.rerun()
 
-st.markdown("<hr style='margin:0 0 16px;border:none;border-top:1px solid #f3f4f6'>",
+st.markdown("<hr style='margin:0 0 12px;border:none;border-top:1px solid #f3f4f6'>",
             unsafe_allow_html=True)
 
-# ── Sem dados ─────────────────────────────────────────────────────────────────
 df = st.session_state.df
 if df is None or df.empty:
-    st.info("Faça upload do Simulador ODP (.xlsm) para começar.")
+    st.info("Faça upload do arquivo do Calendário Salesforce (.xlsm) para começar.")
     st.stop()
 
 data_ref  = st.session_state.data_ref
 ontem     = data_ref - timedelta(days=1)
+df_on     = df[df.status_op == 'ON'].copy()
+df_ontem  = df[(df.status_op == 'x') & (df['ed'].dt.date == ontem)].copy()
+df_fut    = df[df.status_op == '-'].copy()
+ajustes   = st.session_state.ajustes
 
-# partições principais
-df_on    = df[df['status'] == 'ON'].copy()
-df_ontem = df[(df['status'] == 'x') & (df['ed'].dt.date == ontem)].copy()
-df_fut   = df[df['status'] == '-'].copy()
-
-# ── ABAS ─────────────────────────────────────────────────────────────────────
-aba_dash, aba_saidas, aba_blocado, aba_rfcst, aba_dados = st.tabs([
-    "Dashboard", "Saídas", "Blocado", "Reforecast", "Dados"
+# ── ABAS ──────────────────────────────────────────────────────────────────────
+t_dash, t_sai, t_bloc, t_rfcst, t_sim, t_dados = st.tabs([
+    "Dashboard", "Saídas", "Blocado", "Reforecast", "Simulações", "Dados"
 ])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# ABA 1 — DASHBOARD
-# ═════════════════════════════════════════════════════════════════════════════
-with aba_dash:
+# ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+with t_dash:
+    alertas = df_on[df_on['desvio_abs'].abs() > 0.15]
+    pal_hoje = df_on['pallets'].sum()
 
-    # ── Métricas de topo ──────────────────────────────────────────────────────
-    pal_hoje = df_on['pallets'].sum() + df_ontem['pallets'].sum()
-    alertas  = df_on[df_on['desvio_abs'].abs() > 0.15]
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric("Campanhas ON", len(df_on))
+    m2.metric("Encerradas ontem", len(df_ontem))
+    m3.metric("Pallets blocados hoje", fn(pal_hoje))
+    m4.metric("Alertas (desvio >15 p.p.)", len(alertas),
+              delta_color="inverse" if len(alertas) else "off",
+              delta="atenção necessária" if len(alertas) else "ok")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Campanhas ON agora",   len(df_on))
-    m2.metric("Encerradas ontem",     len(df_ontem))
-    m3.metric("Pallets blocados hoje",fmt_n(pal_hoje),
-              delta=f"{pal_hoje/CAP_BU*100:.0f}% da cap. BU",
-              delta_color="off")
-    m4.metric("Com desvio > ±15 p.p.",len(alertas),
-              delta="requerem atenção" if len(alertas) else "tudo dentro do esperado",
-              delta_color="inverse" if len(alertas) else "off")
+    incl_enc = st.checkbox("Incluir encerradas ontem", False, key='d_enc')
+    df_view  = pd.concat([df_on, df_ontem]) if incl_enc else df_on
 
-    # ── Campanhas ativas ──────────────────────────────────────────────────────
-    st.markdown('<div class="titulo-sec">Campanhas ativas agora</div>', unsafe_allow_html=True)
-    _mostrar_encerradas = st.checkbox("Incluir encerradas ontem", value=False, key='dash_enc')
-    df_view = pd.concat([df_on, df_ontem]) if _mostrar_encerradas else df_on
+    st.markdown('<div class="sec">Campanhas</div>', unsafe_allow_html=True)
+    for _, c in df_view.sort_values('ed').iterrows():
+        aj_flag = c['id'] in ajustes
+        status_b = ({'ON':'badge-on','x':'badge-x'}).get(c['status_op'],'badge-fut')
+        alerta_s = ""
+        if abs(c['desvio_abs']) > 0.15:
+            s = "+" if c['desvio_abs'] > 0 else ""
+            alerta_s = f' &nbsp;<span style="color:#dc2626;font-size:11px;font-weight:600">⚑ {s}{c["desvio_abs"]*100:.1f} p.p.</span>'
+        aj_s = ' &nbsp;<span class="badge-aj">ajustada</span>' if aj_flag else ''
 
-    for _, camp in df_view.sort_values('ed').iterrows():
-        badge = ('badge-on'  if camp['status'] == 'ON'
-                 else 'badge-x')
-        alerta_str = ""
-        if abs(camp['desvio_abs']) > 0.15:
-            sinal = "+" if camp['desvio_abs'] > 0 else ""
-            alerta_str = f'<span class="alerta">⚑ {sinal}{camp["desvio_abs"]*100:.1f} p.p.</span>'
-
-        header_html = (
-            f'<span class="{badge}">{camp["status"]}</span> &nbsp;'
-            f'<b>{camp["campanha"]}</b> &nbsp;'
-            f'<span style="color:#9ca3af;font-size:12px">'
-            f'{camp["cat"]} · {camp["cd"]} · '
-            f'{camp["sd"].strftime("%d/%m")} → {camp["ed"].strftime("%d/%m")} · '
-            f'dia {camp["dia_atual"]} de {camp["wd"]}'
-            f'</span> &nbsp; {alerta_str}'
-        )
-
-        with st.expander(camp['campanha'], expanded=False):
-            st.markdown(header_html, unsafe_allow_html=True)
-            c1,c2,c3,c4,c5,c6 = st.columns(6)
-            c1.metric("Estoque",    fmt_n(camp['estoque']))
-            c2.metric("Pallets",    fmt_n(camp['pallets']))
-            c3.metric("Forecast",   fmt_n(camp['forecast']))
-            c4.metric("SO congel.", fmt_pct(camp['so_cong']))
-            c5.metric("Venda real", fmt_n(camp['venda_real']))
-            c6.metric("SO real",    fmt_pct(camp['so_real_acum']))
-
-            c7,c8,c9,c10 = st.columns(4)
-            c7.metric("Reforecast", fmt_n(camp['reforecast']))
-            c8.metric("Novo SO",    fmt_pct(camp['novo_so']))
-            c9.metric("Descida DN", camp['dn'].strftime('%d/%m/%Y'))
-            c10.metric("Subida DO", camp['do_'].strftime('%d/%m/%Y'))
-
-            # barra de progresso
-            prog = camp['dia_atual'] / camp['wd'] if camp['wd'] > 0 else 0
-            st.progress(float(prog), text=f"Progresso: dia {camp['dia_atual']} / {camp['wd']}")
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ABA 2 — SAÍDAS
-# ═════════════════════════════════════════════════════════════════════════════
-with aba_saidas:
-    # ── Filtros ───────────────────────────────────────────────────────────────
-    fc1, fc2, fc3, fc4 = st.columns([2,2,2,2])
-    with fc1:
-        opcoes_cd  = ['Todos'] + sorted(df['cd'].unique().tolist())
-        sel_cd     = st.selectbox("CD", opcoes_cd, key='sai_cd')
-    with fc2:
-        opcoes_cat = ['Todas'] + sorted(df['cat'].unique().tolist())
-        sel_cat    = st.selectbox("Categoria", opcoes_cat, key='sai_cat')
-    with fc3:
-        unidade    = st.radio("Unidade", ["Convertido","Bruto"], horizontal=True, key='sai_uni')
-    with fc4:
-        dt_range   = st.date_input("Período",
-                     value=(data_ref - timedelta(days=7), data_ref + timedelta(days=30)),
-                     key='sai_per')
-
-    df_sai_base = df.copy()
-    if sel_cd  != 'Todos':  df_sai_base = df_sai_base[df_sai_base['cd'] == sel_cd]
-    if sel_cat != 'Todas':  df_sai_base = df_sai_base[df_sai_base['cat'] == sel_cat]
-
-    dt_ini_s = dt_range[0] if len(dt_range) == 2 else data_ref - timedelta(days=7)
-    dt_fim_s = dt_range[1] if len(dt_range) == 2 else data_ref + timedelta(days=30)
-
-    # gera série — usa curva simplificada (uniforme)
-    with st.spinner("Calculando saídas..."):
-        uni_str = 'convertido' if unidade == 'Convertido' else 'bruto'
-        serie_sai = gerar_serie_saidas(df_sai_base, dt_ini_s, dt_fim_s, uni_str)
-
-    if not serie_sai.empty:
-        # agrega por data e tipo
-        pivot = (serie_sai.groupby(['data','tipo'])['volume']
-                 .sum().unstack(fill_value=0).reset_index())
-        for t in ['realizado','reforecast','previsto']:
-            if t not in pivot.columns:
-                pivot[t] = 0
-
-        fig_sai = go.Figure()
-        for tipo, cor, label in [
-            ('realizado',  CORES_TIPO['realizado'],  'Realizado'),
-            ('reforecast', CORES_TIPO['reforecast'], 'Reforecast'),
-            ('previsto',   CORES_TIPO['previsto'],   'Previsto'),
-        ]:
-            fig_sai.add_bar(x=pivot['data'], y=pivot[tipo],
-                            name=label, marker_color=cor)
-
-        fig_sai.update_layout(
-            barmode='stack', height=320,
-            margin=dict(l=0,r=0,t=10,b=0),
-            legend=dict(orientation='h', y=1.08),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(title=f"Peças ({unidade.lower()})", gridcolor='#f3f4f6'),
-            plot_bgcolor='white', paper_bgcolor='white',
-            font=dict(family='DM Sans', size=12),
-        )
-        # linha de capacidade check-out
-        cap_val = CAP_CHECKOUT if uni_str == 'convertido' else CAP_CHECKIN
-        fig_sai.add_hline(y=cap_val, line_dash='dot', line_color='#dc2626',
-                          annotation_text=f"Cap. {cap_val:,.0f}", annotation_font_size=11)
-        st.plotly_chart(fig_sai, use_container_width=True)
-
-    # ── Tabela por campanha ───────────────────────────────────────────────────
-    st.markdown('<div class="titulo-sec">Detalhe por campanha</div>', unsafe_allow_html=True)
-    for _, camp in df_sai_base.sort_values('sd').iterrows():
-        with st.expander(f"{camp['campanha']} · {camp['cat']} · {camp['sd'].strftime('%d/%m')}→{camp['ed'].strftime('%d/%m')}"):
-            c1,c2,c3,c4 = st.columns(4)
-            c1.metric("Reforecast total", fmt_n(camp['reforecast']))
-            c2.metric("Fat. OUT",         f"{camp['fat_out']:.2f}×")
-            c3.metric("Curva usada",      f"{camp['cat']} {camp['wd']}wd")
-            c4.metric("Dias restantes",   fmt_n(camp['dias_rest']))
-
-            # mini série desta campanha
-            s_camp = serie_sai[serie_sai['id'] == camp['id']]
-            if not s_camp.empty:
-                s_p = s_camp.groupby(['data','tipo'])['volume'].sum().unstack(fill_value=0).reset_index()
-                for t in ['realizado','reforecast','previsto']:
-                    if t not in s_p.columns: s_p[t] = 0
-                fig_c = go.Figure()
-                for tipo, cor in [('realizado','#1e3a5f'),('reforecast','#3b82f6'),('previsto','#bfdbfe')]:
-                    fig_c.add_bar(x=s_p['data'], y=s_p[tipo], name=tipo, marker_color=cor)
-                fig_c.update_layout(barmode='stack', height=180,
-                                    margin=dict(l=0,r=0,t=5,b=0),
-                                    showlegend=False, plot_bgcolor='white',
-                                    paper_bgcolor='white',
-                                    xaxis=dict(showgrid=False),
-                                    yaxis=dict(gridcolor='#f3f4f6'))
-                st.plotly_chart(fig_c, use_container_width=True)
-
-    # ── Exportar ──────────────────────────────────────────────────────────────
-    if not serie_sai.empty:
-        csv = (serie_sai.groupby(['data','campanha','cat','cd','tipo'])['volume']
-               .sum().reset_index().to_csv(index=False, sep=';').encode('utf-8-sig'))
-        st.download_button("⬇ Exportar tabela de saídas (.csv)", csv,
-                           "saidas_odp.csv", "text/csv")
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ABA 3 — BLOCADO
-# ═════════════════════════════════════════════════════════════════════════════
-with aba_blocado:
-    # ── Filtros ───────────────────────────────────────────────────────────────
-    fb1, fb2, fb3 = st.columns([2,2,3])
-    with fb1:
-        sel_cd_b = st.selectbox("CD", ['Todos'] + sorted(df['cd'].unique().tolist()), key='bl_cd')
-    with fb2:
-        uni_b = st.radio("Unidade", ["Pallets","Peças brutas","Peças conv."], horizontal=True, key='bl_uni')
-    with fb3:
-        dt_range_b = st.date_input("Período",
-                     value=(data_ref - timedelta(days=7), data_ref + timedelta(days=45)),
-                     key='bl_per')
-
-    df_bl = df.copy()
-    if sel_cd_b != 'Todos':
-        df_bl = df_bl[df_bl['cd'] == sel_cd_b]
-
-    dt_ini_b = dt_range_b[0] if len(dt_range_b) == 2 else data_ref - timedelta(days=7)
-    dt_fim_b = dt_range_b[1] if len(dt_range_b) == 2 else data_ref + timedelta(days=45)
-
-    # série de blocado
-    with st.spinner("Calculando blocado..."):
-        serie_bl = gerar_serie_blocado(df_bl, dt_ini_b, dt_fim_b)
-
-    if uni_b == "Peças brutas":
-        col_vol = 'pcs_brutas'
-        # recalcular com peças brutas (pallets * pcs_pal por campanha)
-        rows_bl2 = []
-        datas_bl = pd.date_range(dt_ini_b, dt_fim_b, freq='D')
-        for dt in datas_bl:
-            dt_d = dt.date()
-            ativas = df_bl[(df_bl['dn'].dt.date <= dt_d) & (df_bl['do_'].dt.date >= dt_d)]
-            rows_bl2.append({'data': dt, 'vol': ativas['estoque'].sum()})
-        serie_plot = pd.DataFrame(rows_bl2)
-        cap_linha  = None
-        ytitle     = "Peças brutas"
-    elif uni_b == "Peças conv.":
-        rows_bl3 = []
-        datas_bl = pd.date_range(dt_ini_b, dt_fim_b, freq='D')
-        for dt in datas_bl:
-            dt_d = dt.date()
-            ativas = df_bl[(df_bl['dn'].dt.date <= dt_d) & (df_bl['do_'].dt.date >= dt_d)]
-            vol = (ativas['estoque'] / ativas['fat_in'].replace(0,1)).sum()
-            rows_bl3.append({'data': dt, 'vol': vol})
-        serie_plot = pd.DataFrame(rows_bl3)
-        cap_linha  = CAP_CHECKOUT
-        ytitle     = "Peças convertidas"
-    else:
-        serie_plot = serie_bl.rename(columns={'pallets':'vol'})
-        cap_linha  = CAP_BU
-        ytitle     = "Pallets"
-
-    if not serie_plot.empty:
-        fig_bl = go.Figure()
-        fig_bl.add_scatter(x=serie_plot['data'], y=serie_plot['vol'],
-                           fill='tozeroy', fillcolor='rgba(59,130,246,0.15)',
-                           line=dict(color='#3b82f6', width=2),
-                           name=ytitle, hovertemplate='%{x|%d/%m}<br>%{y:,.0f}<extra></extra>')
-        if cap_linha:
-            fig_bl.add_hline(y=cap_linha, line_dash='dot', line_color='#dc2626',
-                             annotation_text=f"Cap. {cap_linha:,}", annotation_font_size=11)
-        fig_bl.update_layout(
-            height=320, margin=dict(l=0,r=0,t=10,b=0),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(title=ytitle, gridcolor='#f3f4f6'),
-            plot_bgcolor='white', paper_bgcolor='white',
-            font=dict(family='DM Sans', size=12),
-        )
-        st.plotly_chart(fig_bl, use_container_width=True)
-
-    # ── Métricas ──────────────────────────────────────────────────────────────
-    pico_pal = serie_bl['pallets'].max() if not serie_bl.empty else 0
-    desc_sem = df_bl[(df_bl['dn'].dt.date >= data_ref) &
-                     (df_bl['dn'].dt.date <= data_ref + timedelta(days=7))]
-    sub_sem  = df_bl[(df_bl['do_'].dt.date >= data_ref) &
-                     (df_bl['do_'].dt.date <= data_ref + timedelta(days=7))]
-    mb1,mb2,mb3 = st.columns(3)
-    mb1.metric("Pico próx. 45 dias", fmt_n(pico_pal) + " pal",
-               delta=f"{pico_pal/CAP_BU*100:.0f}% da cap. BU", delta_color="off")
-    mb2.metric("Descidas esta semana", len(desc_sem),
-               delta="campanhas entram no picking")
-    mb3.metric("Subidas esta semana",  len(sub_sem),
-               delta="campanhas saem do picking")
-
-    # ── Tabela por campanha ───────────────────────────────────────────────────
-    st.markdown('<div class="titulo-sec">Detalhe por campanha</div>', unsafe_allow_html=True)
-    df_bl_sort = df_bl.sort_values('dn')
-    for _, camp in df_bl_sort.iterrows():
-        status_badge = {'ON':'🟢','x':'⚪','-':'🔵'}.get(camp['status'],'')
-        with st.expander(f"{status_badge} {camp['campanha']} · {camp['cat']} · DN {camp['dn'].strftime('%d/%m')} → DO {camp['do_'].strftime('%d/%m')}"):
-            c1,c2,c3,c4,c5 = st.columns(5)
-            c1.metric("Pallets",    fmt_n(camp['pallets']))
-            c2.metric("Pç brutas",  fmt_n(camp['estoque']))
-            c3.metric("Pç/palete",  fmt_n(camp['pcs_pal']))
-            c4.metric("Fat. IN",    f"{camp['fat_in']:.2f}×")
-            c5.metric("CD",         camp['cd'])
-
-    # ── Exportar ──────────────────────────────────────────────────────────────
-    exp_bl = df_bl[['id','campanha','cat','setor','cd','status','sd','ed','dn','do_',
-                     'estoque','pallets','pcs_pal','fat_in','fat_out']].copy()
-    exp_bl.columns = ['ID','Campanha','Categoria','Setor','CD','Status',
-                       'SD','ED','DN','DO','Estoque','Pallets','Pcs/Pal','Fat IN','Fat OUT']
-    csv_bl = exp_bl.to_csv(index=False, sep=';').encode('utf-8-sig')
-    st.download_button("⬇ Exportar tabela de blocado (.csv)", csv_bl,
-                       "blocado_odp.csv", "text/csv")
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ABA 4 — REFORECAST
-# ═════════════════════════════════════════════════════════════════════════════
-with aba_rfcst:
-    # ── Filtros ───────────────────────────────────────────────────────────────
-    fr1, fr2, fr3 = st.columns([2,2,2])
-    with fr1:
-        mostrar_rf = st.radio("Campanhas", ["Só ativas (ON)","Todas"], horizontal=True, key='rf_show')
-    with fr2:
-        so_alerta_rf = st.radio("Filtro", ["Todas","Só com desvio >15 p.p."], horizontal=True, key='rf_fil')
-    with fr3:
-        sel_cd_rf = st.selectbox("CD", ['Todos'] + sorted(df['cd'].unique().tolist()), key='rf_cd')
-
-    df_rf = df.copy()
-    if mostrar_rf == "Só ativas (ON)":
-        df_rf = df_rf[df_rf['status'] == 'ON']
-    if so_alerta_rf == "Só com desvio >15 p.p.":
-        df_rf = df_rf[df_rf['desvio_abs'].abs() > 0.15]
-    if sel_cd_rf != 'Todos':
-        df_rf = df_rf[df_rf['cd'] == sel_cd_rf]
-
-    df_rf = df_rf.sort_values('desvio_abs', key=abs, ascending=False)
-
-    st.markdown('<div class="titulo-sec">Racional de reforecast por campanha</div>',
+        with st.expander(c['campanha']):
+            st.markdown(
+                f'<span class="{status_b}">{c["status_op"]}</span> &nbsp;'
+                f'<b>{c["campanha"]}</b> &nbsp;'
+                f'<span style="color:#9ca3af;font-size:12px">'
+                f'{c["cat"]} · {c["cd"]} · '
+                f'{c["sd"].strftime("%d/%m")}→{c["ed"].strftime("%d/%m")} · '
+                f'dia {c["dia_atual"]} de {c["wd"]}'
+                f'</span>{alerta_s}{aj_s}',
                 unsafe_allow_html=True)
 
-    for _, camp in df_rf.iterrows():
-        desvio_cor = cor_desvio(camp['desvio_abs'])
-        sinal = "+" if camp['desvio_abs'] >= 0 else ""
-        status_str = {'ON':'🟢','x':'⚪','-':'🔵'}.get(camp['status'],'')
-        badge_dev = (f'<span style="color:{desvio_cor};font-weight:600">'
-                     f'{sinal}{camp["desvio_abs"]*100:.1f} p.p.</span>')
+            a1,a2,a3,a4,a5,a6 = st.columns(6)
+            a1.metric("Estoque",    fn(c['estoque']))
+            a2.metric("Pallets",    fn(c['pallets']))
+            a3.metric("Forecast",   fn(c['forecast']))
+            a4.metric("SO congelado", fp(c['so_cong']))
+            a5.metric("Venda real", fn(c['venda_real']))
+            a6.metric("SO real",    fp(c['so_real_acum']))
 
-        with st.expander(
-            f"{status_str} {camp['campanha']}  ·  "
-            f"dia {camp['dia_atual']}/{camp['wd']}  ·  "
-            f"desvio {sinal}{camp['desvio_abs']*100:.1f} p.p."
-        ):
-            # barra dupla: previsto vs real
-            prog_prev = float(min(1, camp['so_prev_acum']))
-            prog_real = float(min(1, camp['so_real_acum']))
+            b1,b2,b3,b4 = st.columns(4)
+            b1.metric("Reforecast", fn(c['reforecast']))
+            b2.metric("Novo SO",    fp(c['novo_so']))
+            b3.metric("DN (descida)", c['dn'].strftime('%d/%m/%Y'))
+            b4.metric("DO (subida)", c['do_'].strftime('%d/%m/%Y'))
 
+            prog = float(c['dia_atual']/c['wd']) if c['wd'] > 0 else 0
+            st.progress(prog, text=f"Progresso: dia {c['dia_atual']} / {c['wd']}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SAÍDAS
+# ══════════════════════════════════════════════════════════════════════════════
+with t_sai:
+    f1,f2,f3,f4 = st.columns([2,2,2,3])
+    sel_cd_s  = f1.selectbox("CD", ['Todos']+sorted(df['cd'].dropna().unique().tolist()), key='s_cd')
+    sel_cat_s = f2.selectbox("Categoria", ['Todas']+sorted(df['cat'].dropna().unique().tolist()), key='s_cat')
+    uni_s     = f3.radio("Unidade", ["Pç convertidas","Pç brutas"], horizontal=True, key='s_uni')
+    rng_s     = f4.date_input("Período",
+                value=(data_ref-timedelta(days=7), data_ref+timedelta(days=30)),
+                key='s_per')
+
+    dfi = df.copy()
+    if sel_cd_s  != 'Todos': dfi = dfi[dfi['cd']  == sel_cd_s]
+    if sel_cat_s != 'Todas': dfi = dfi[dfi['cat'] == sel_cat_s]
+
+    d0 = rng_s[0] if len(rng_s)==2 else data_ref-timedelta(days=7)
+    d1 = rng_s[1] if len(rng_s)==2 else data_ref+timedelta(days=30)
+
+    uni_str = 'pecas_conv' if uni_s.startswith('Pç conv') else 'pecas_brutas'
+    with st.spinner("Calculando saídas..."):
+        ss = serie_saidas(dfi, d0, d1, st.session_state.curvas, uni_str)
+
+    if not ss.empty:
+        pv = ss.groupby(['data','tipo'])['volume'].sum().unstack(fill_value=0).reset_index()
+        for t in ['realizado','reforecast','previsto']:
+            if t not in pv.columns: pv[t] = 0
+
+        fig = go.Figure()
+        for tipo, cor, lab in [('realizado',CORES['realizado'],'Realizado'),
+                                ('reforecast',CORES['reforecast'],'Reforecast'),
+                                ('previsto',CORES['previsto'],'Previsto')]:
+            fig.add_bar(x=pv['data'], y=pv[tipo], name=lab, marker_color=cor)
+        fig.update_layout(barmode='stack', height=300,
+                          margin=dict(l=0,r=0,t=10,b=0),
+                          legend=dict(orientation='h',y=1.08),
+                          xaxis=dict(showgrid=False),
+                          yaxis=dict(gridcolor='#f3f4f6', title=uni_s),
+                          plot_bgcolor='white', paper_bgcolor='white',
+                          font=dict(family='DM Sans',size=12))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown('<div class="sec">Detalhe por campanha</div>', unsafe_allow_html=True)
+    for _, c in dfi.sort_values('sd').iterrows():
+        with st.expander(f"{c['campanha']} · {c['cat']} · {c['sd'].strftime('%d/%m')}→{c['ed'].strftime('%d/%m')}"):
+            x1,x2,x3,x4 = st.columns(4)
+            x1.metric("Reforecast", fn(c['reforecast']))
+            x2.metric("Fator OUT",  f"{c['fat_out']:.3f}×")
+            x3.metric("Curva",      f"{c['cat']} {c['wd']}wd")
+            x4.metric("Dias rest.", fn(c['dias_rest']))
+            if not ss.empty:
+                sc = ss[ss['id']==c['id']]
+                if not sc.empty:
+                    sp = sc.groupby(['data','tipo'])['volume'].sum().unstack(fill_value=0).reset_index()
+                    for t in ['realizado','reforecast','previsto']:
+                        if t not in sp.columns: sp[t]=0
+                    fc = go.Figure()
+                    for tipo, cor in [('realizado',CORES['realizado']),
+                                      ('reforecast',CORES['reforecast']),
+                                      ('previsto',CORES['previsto'])]:
+                        fc.add_bar(x=sp['data'], y=sp[tipo], name=tipo, marker_color=cor)
+                    fc.update_layout(barmode='stack', height=160, showlegend=False,
+                                     margin=dict(l=0,r=0,t=4,b=0),
+                                     xaxis=dict(showgrid=False),
+                                     yaxis=dict(gridcolor='#f3f4f6'),
+                                     plot_bgcolor='white', paper_bgcolor='white')
+                    st.plotly_chart(fc, use_container_width=True)
+
+    if not ss.empty:
+        csv = ss.groupby(['data','campanha','cat','cd','tipo'])['volume'].sum().reset_index()
+        st.download_button("⬇ Exportar saídas (.csv)",
+                           csv.to_csv(index=False,sep=';').encode('utf-8-sig'),
+                           "saidas_odp.csv","text/csv")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCADO
+# ══════════════════════════════════════════════════════════════════════════════
+with t_bloc:
+    b1,b2,b3 = st.columns([2,3,3])
+    sel_cd_b = b1.selectbox("CD", ['Todos']+sorted(df['cd'].dropna().unique().tolist()), key='b_cd')
+    uni_b    = b2.radio("Unidade", ["Pallets","Pç brutas","Pç convertidas"], horizontal=True, key='b_uni')
+    rng_b    = b3.date_input("Período",
+               value=(data_ref-timedelta(days=7), data_ref+timedelta(days=45)), key='b_per')
+
+    dfb = df.copy()
+    if sel_cd_b != 'Todos': dfb = dfb[dfb['cd']==sel_cd_b]
+    db0 = rng_b[0] if len(rng_b)==2 else data_ref-timedelta(days=7)
+    db1 = rng_b[1] if len(rng_b)==2 else data_ref+timedelta(days=45)
+
+    uni_bstr = {'Pallets':'pallets','Pç brutas':'pecas_brutas','Pç convertidas':'pecas_conv'}[uni_b]
+    with st.spinner("Calculando blocado..."):
+        sb = serie_blocado(dfb, db0, db1, uni_bstr)
+
+    if not sb.empty:
+        fig_b = go.Figure()
+        fig_b.add_scatter(x=sb['data'], y=sb['volume'],
+                          fill='tozeroy', fillcolor='rgba(59,130,246,0.12)',
+                          line=dict(color='#3b82f6',width=2), name=uni_b,
+                          hovertemplate='%{x|%d/%m}<br>%{y:,.0f}<extra></extra>')
+        fig_b.update_layout(height=300, margin=dict(l=0,r=0,t=10,b=0),
+                             xaxis=dict(showgrid=False),
+                             yaxis=dict(gridcolor='#f3f4f6', title=uni_b),
+                             plot_bgcolor='white', paper_bgcolor='white',
+                             font=dict(family='DM Sans',size=12))
+        st.plotly_chart(fig_b, use_container_width=True)
+
+    pico = sb['volume'].max() if not sb.empty else 0
+    desc_sem = dfb[(dfb['dn'].dt.date >= data_ref) & (dfb['dn'].dt.date <= data_ref+timedelta(7))]
+    sub_sem  = dfb[(dfb['do_'].dt.date >= data_ref) & (dfb['do_'].dt.date <= data_ref+timedelta(7))]
+    c1,c2,c3 = st.columns(3)
+    c1.metric(f"Pico blocado ({uni_b})", fn(pico))
+    c2.metric("Descidas esta semana", len(desc_sem), delta="campanhas entram no picking")
+    c3.metric("Subidas esta semana",  len(sub_sem),  delta="campanhas saem do picking")
+
+    st.markdown('<div class="sec">Detalhe por campanha</div>', unsafe_allow_html=True)
+    for _, c in dfb.sort_values('dn').iterrows():
+        ic = {'ON':'🟢','x':'⚪','-':'🔵'}.get(c['status_op'],'')
+        with st.expander(f"{ic} {c['campanha']} · DN {c['dn'].strftime('%d/%m')} → DO {c['do_'].strftime('%d/%m')}"):
+            d1,d2,d3,d4,d5 = st.columns(5)
+            d1.metric("Pallets",   fn(c['pallets']))
+            d2.metric("Pç brutas", fn(c['estoque']))
+            d3.metric("Pç/palete", fn(c['pcs_pal']))
+            d4.metric("Fator IN",  f"{c['fat_in']:.3f}×")
+            d5.metric("CD",        c['cd'])
+
+    st.download_button("⬇ Exportar blocado (.csv)",
+        dfb[['id','campanha','cat','setor','cd','status_op','sd','ed',
+             'dn','do_','estoque','pallets','pcs_pal','fat_in','fat_out']]
+        .to_csv(index=False,sep=';').encode('utf-8-sig'),
+        "blocado_odp.csv","text/csv")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REFORECAST
+# ══════════════════════════════════════════════════════════════════════════════
+with t_rfcst:
+    r1,r2,r3 = st.columns([2,2,2])
+    show_rf  = r1.radio("Campanhas", ["Só ON","Todas"], horizontal=True, key='r_sh')
+    fil_rf   = r2.radio("Filtro", ["Todas","Só alertas (>15 p.p.)"], horizontal=True, key='r_fi')
+    sel_cd_r = r3.selectbox("CD", ['Todos']+sorted(df['cd'].dropna().unique().tolist()), key='r_cd')
+
+    dfr = df.copy()
+    if show_rf == "Só ON":                   dfr = dfr[dfr['status_op']=='ON']
+    if fil_rf  == "Só alertas (>15 p.p.)":  dfr = dfr[dfr['desvio_abs'].abs()>0.15]
+    if sel_cd_r != 'Todos':                  dfr = dfr[dfr['cd']==sel_cd_r]
+    dfr = dfr.sort_values('desvio_abs', key=abs, ascending=False)
+
+    for _, c in dfr.iterrows():
+        cor = '#16a34a' if abs(c['desvio_abs'])<0.05 else ('#d97706' if abs(c['desvio_abs'])<0.15 else '#dc2626')
+        s   = "+" if c['desvio_abs']>=0 else ""
+        ic  = {'ON':'🟢','x':'⚪','-':'🔵'}.get(c['status_op'],'')
+
+        with st.expander(f"{ic} {c['campanha']} · dia {c['dia_atual']}/{c['wd']} · {s}{c['desvio_abs']*100:.1f} p.p."):
+            pp = float(min(1, c['so_prev_acum']))
+            pr = float(min(1, c['so_real_acum']))
             st.markdown(f"""
             <div style='margin-bottom:12px'>
-              <div style='display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin-bottom:4px'>
-                <span>SO previsto acum.</span><span>{prog_prev*100:.1f}%</span>
-              </div>
-              <div style='background:#f3f4f6;border-radius:4px;height:8px'>
-                <div style='width:{prog_prev*100:.1f}%;background:#93c5fd;border-radius:4px;height:100%'></div>
-              </div>
-              <div style='display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin:8px 0 4px'>
+              <div style='display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin-bottom:3px'>
+                <span>SO previsto acum.</span><span>{pp*100:.1f}%</span></div>
+              <div style='background:#f3f4f6;border-radius:4px;height:7px'>
+                <div style='width:{pp*100:.1f}%;background:#93c5fd;border-radius:4px;height:100%'></div></div>
+              <div style='display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin:7px 0 3px'>
                 <span>SO real acum.</span>
-                <span style='color:{desvio_cor};font-weight:600'>{prog_real*100:.1f}% ({sinal}{camp["desvio_abs"]*100:.1f} p.p.)</span>
-              </div>
-              <div style='background:#f3f4f6;border-radius:4px;height:8px'>
-                <div style='width:{prog_real*100:.1f}%;background:{desvio_cor};border-radius:4px;height:100%'></div>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+                <span style='color:{cor};font-weight:600'>{pr*100:.1f}% ({s}{c["desvio_abs"]*100:.1f} p.p.)</span></div>
+              <div style='background:#f3f4f6;border-radius:4px;height:7px'>
+                <div style='width:{pr*100:.1f}%;background:{cor};border-radius:4px;height:100%'></div></div>
+            </div>""", unsafe_allow_html=True)
 
-            c1,c2,c3,c4,c5,c6 = st.columns(6)
-            c1.metric("Venda real",   fmt_n(camp['venda_real']))
-            c2.metric("Reforecast",   fmt_n(camp['reforecast']))
-            c3.metric("Var vs FC",    fmt_pct(camp['mudanca_vs_fc']))
-            c4.metric("Novo SO",      fmt_pct(camp['novo_so']))
-            c5.metric("SO congel.",   fmt_pct(camp['so_cong']))
-            c6.metric("Fator ajuste", f"{camp['fator_ajuste']:.2f}×")
+            e1,e2,e3,e4,e5,e6 = st.columns(6)
+            e1.metric("Venda real",   fn(c['venda_real']))
+            e2.metric("Reforecast",   fn(c['reforecast']))
+            e3.metric("Var vs FC",    fp(c['mudanca_fc']))
+            e4.metric("Novo SO",      fp(c['novo_so']))
+            e5.metric("SO congelado", fp(c['so_cong']))
+            e6.metric("Fator ajuste", f"{c['fator_ajuste']:.3f}×")
 
-            # funil QB→QR
-            st.markdown("**Racional completo (QB → QR)**")
-            tb = {
-                "QB · Dias de venda":                 camp['dias_venda'],
-                "QC · Dias restantes":                camp['dias_rest'],
-                "QD · Proj. acumulada até D-1":       fmt_pct(camp['proj_acum']),
-                "QE · SO previsto acum.":             fmt_pct(camp['so_prev_acum']),
-                "QF · Venda real acum.":              fmt_n(camp['venda_real']),
-                "QG · SO real acum.":                 fmt_pct(camp['so_real_acum']),
-                "QH · Desvio abs (SO real–prev)":     f"{camp['desvio_abs']*100:+.2f} p.p.",
-                "QI · Desvio rel (SO real/prev – 1)": fmt_pct(camp['desvio_rel']),
-                "QJ · Desvio médio":                  fmt_pct((camp['desvio_abs']+camp['desvio_rel'])/2),
-                "QK · Fator de ajuste (1+QJ)":        f"{camp['fator_ajuste']:.3f}×",
-                "QL · % restante da curva":           fmt_pct(1-camp['proj_acum']),
-                "QO · Reforecast final":              fmt_n(camp['reforecast']),
-                "QP · Var vs Forecast congelado":     fmt_pct(camp['mudanca_vs_fc']),
-                "QQ · Novo Sell-out (estoque)":       fmt_pct(camp['novo_so']),
-                "QR · Var vs SO original":            f"{camp['desvio_vs_so']*100:+.2f} p.p.",
-            }
-            st.table(pd.DataFrame.from_dict(tb, orient='index', columns=['Valor']))
+            with st.expander("Racional QB → QR"):
+                racional = {
+                    "QB · Dias de venda":             c['dias_decor'],
+                    "QC · Dias restantes":            c['dias_rest'],
+                    "QD/QE · Proj. acum. (curva)":   fp(c['proj_acum']),
+                    "QF · Venda real":                fn(c['venda_real']),
+                    "QG · SO real acum.":             fp(c['so_real_acum']),
+                    "QH · Desvio absoluto":           f"{c['desvio_abs']*100:+.2f} p.p.",
+                    "QI · Desvio relativo":           fp(c['desvio_rel']),
+                    "QJ · Desvio médio":              fp((c['desvio_abs']+c['desvio_rel'])/2),
+                    "QK · Fator ajuste (1+QJ)":       f"{c['fator_ajuste']:.3f}×",
+                    "QL · % restante curva":          fp(1-c['proj_acum']),
+                    "QO · Reforecast final":          fn(c['reforecast']),
+                    "QP · Var vs Forecast congelado": fp(c['mudanca_fc']),
+                    "QQ · Novo sell-out (estoque)":   fp(c['novo_so']),
+                    "QR · Var vs SO original":        f"{c['desvio_so']*100:+.2f} p.p.",
+                }
+                st.table(pd.DataFrame.from_dict(racional, orient='index', columns=['Valor']))
 
-    # ── Exportar ──────────────────────────────────────────────────────────────
-    cols_exp = ['id','campanha','cat','cd','status','sd','ed','wd',
+    cols_exp = ['id','campanha','cat','cd','status_op','sd','ed','wd',
                 'estoque','forecast','so_cong','venda_real','so_real_acum',
-                'desvio_abs','fator_ajuste','reforecast','novo_so','mudanca_vs_fc']
-    exp_rf = df_rf[cols_exp].copy()
-    exp_rf.columns = ['ID','Campanha','Categoria','CD','Status','SD','ED','WD',
-                       'Estoque','Forecast','SO Congel.','Venda Real','SO Real',
-                       'Desvio (p.p.)','Fator Ajuste','Reforecast','Novo SO','Var vs FC']
-    csv_rf = exp_rf.to_csv(index=False, sep=';').encode('utf-8-sig')
-    st.download_button("⬇ Exportar tabela de reforecast (.csv)", csv_rf,
-                       "reforecast_odp.csv", "text/csv")
+                'desvio_abs','fator_ajuste','reforecast','novo_so','mudanca_fc']
+    st.download_button("⬇ Exportar reforecast (.csv)",
+        dfr[cols_exp].to_csv(index=False,sep=';').encode('utf-8-sig'),
+        "reforecast_odp.csv","text/csv")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# ABA 5 — DADOS
-# ═════════════════════════════════════════════════════════════════════════════
-with aba_dados:
-    st.markdown("#### Upload do Simulador ODP")
-    st.markdown("""
-    <div style='border:1.5px dashed #d1d5db;border-radius:12px;padding:24px;
-                text-align:center;color:#6b7280;font-size:13px;margin-bottom:20px'>
-        Use o botão de upload no topo da página para carregar o arquivo <b>.xlsm</b>.<br>
-        <span style='font-size:11px'>O arquivo permanece apenas na sessão — não é armazenado.</span>
-    </div>
-    """, unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMULAÇÕES
+# ══════════════════════════════════════════════════════════════════════════════
+with t_sim:
+    st.markdown('<div class="sec">Ajustes manuais por campanha</div>', unsafe_allow_html=True)
+    st.caption("Altere datas, estoque ou forecast de uma campanha e veja o impacto imediato em todas as abas.")
 
-    if df is not None and not df.empty:
-        st.markdown("#### Arquivo carregado")
-        cdi1,cdi2,cdi3 = st.columns(3)
-        cdi1.metric("Total campanhas ODP", len(df))
-        cdi2.metric("Campanhas ON",  len(df_on))
-        cdi3.metric("Data referência", data_ref.strftime('%d/%m/%Y'))
+    # Seleção da campanha
+    opcoes = df[df['status_op'].isin(['ON','-'])].sort_values('sd')
+    opcoes_nomes = [f"{r['campanha']} ({r['sd'].strftime('%d/%m')}→{r['ed'].strftime('%d/%m')})"
+                    for _, r in opcoes.iterrows()]
+    opcoes_ids   = list(opcoes['id'])
 
-        st.markdown('<div class="titulo-sec">Resumo por status</div>', unsafe_allow_html=True)
-        resumo = (df.groupby('status')
-                  .agg(campanhas=('id','count'),
-                       estoque_total=('estoque','sum'),
-                       pallets_total=('pallets','sum'))
-                  .reset_index()
-                  .rename(columns={'status':'Status','campanhas':'Campanhas',
-                                   'estoque_total':'Estoque Total','pallets_total':'Pallets Total'}))
-        st.dataframe(resumo, use_container_width=True, hide_index=True)
+    if not opcoes_nomes:
+        st.info("Nenhuma campanha ON ou futura disponível para simulação.")
+    else:
+        sel_nome = st.selectbox("Campanha", opcoes_nomes, key='sim_camp')
+        sel_id   = opcoes_ids[opcoes_nomes.index(sel_nome)]
+        camp_orig = df[df['id']==sel_id].iloc[0]
+        aj_exist  = ajustes.get(sel_id, {})
 
-        st.markdown('<div class="titulo-sec">Tabela completa de campanhas</div>', unsafe_allow_html=True)
-        cols_vis = ['id','campanha','status','cat','cd','sd','ed','wd',
-                    'estoque','pallets','forecast','so_cong','reforecast','novo_so']
-        df_vis = df[cols_vis].copy()
-        df_vis.columns = ['ID','Campanha','Status','Categoria','CD','SD','ED','WD',
-                           'Estoque','Pallets','Forecast','SO Congel.','Reforecast','Novo SO']
-        st.dataframe(df_vis, use_container_width=True, hide_index=True)
+        with st.form("form_sim"):
+            st.markdown(f"**{camp_orig['campanha']}** · {camp_orig['cat']} · {camp_orig['cd']}")
+            s1,s2,s3 = st.columns(3)
+            nova_sd = s1.date_input("Data início (SD)",
+                         value=aj_exist.get('sd', camp_orig['sd'].date()), key='sim_sd')
+            nova_ed = s2.date_input("Data fim (ED)",
+                         value=aj_exist.get('ed', camp_orig['ed'].date()), key='sim_ed')
+            nova_wd = s3.number_input("Webdays", min_value=1, max_value=30,
+                         value=int(aj_exist.get('wd', camp_orig['wd'])), key='sim_wd')
+            s4,s5 = st.columns(2)
+            novo_est = s4.number_input("Estoque (peças)",
+                           value=float(aj_exist.get('estoque', camp_orig['estoque'])),
+                           min_value=0.0, step=100.0, key='sim_est')
+            novo_fc  = s5.number_input("Forecast (peças)",
+                           value=float(aj_exist.get('forecast', camp_orig['forecast'])),
+                           min_value=0.0, step=50.0, key='sim_fc')
 
-        csv_all = df_vis.to_csv(index=False, sep=';').encode('utf-8-sig')
-        st.download_button("⬇ Exportar todas as campanhas (.csv)", csv_all,
-                           "campanhas_odp.csv", "text/csv")
+            col_apply, col_reset = st.columns([2,1])
+            aplicar = col_apply.form_submit_button("✓ Aplicar ajuste", use_container_width=True)
+            remover = col_reset.form_submit_button("↺ Remover ajuste", use_container_width=True)
+
+        if aplicar:
+            st.session_state.ajustes[sel_id] = {
+                'sd': nova_sd, 'ed': nova_ed, 'wd': nova_wd,
+                'estoque': novo_est, 'forecast': novo_fc,
+            }
+            reload()
+            st.success(f"Ajuste aplicado para {camp_orig['campanha']}. Todas as abas foram atualizadas.")
+            st.rerun()
+
+        if remover and sel_id in st.session_state.ajustes:
+            del st.session_state.ajustes[sel_id]
+            reload()
+            st.success("Ajuste removido.")
+            st.rerun()
+
+        # Preview do impacto
+        if aj_exist:
+            camp_aj = df[df['id']==sel_id].iloc[0]
+            st.markdown('<div class="sec">Impacto do ajuste</div>', unsafe_allow_html=True)
+            i1,i2,i3,i4 = st.columns(4)
+            i1.metric("Reforecast",
+                       fn(camp_aj['reforecast']),
+                       delta=f"{camp_aj['reforecast']-camp_orig['reforecast']:+,.0f} pç")
+            i2.metric("Pallets",
+                       fn(camp_aj['pallets']),
+                       delta=f"{camp_aj['pallets']-camp_orig['pallets']:+,.0f}")
+            i3.metric("DN (nova)",  camp_aj['dn'].strftime('%d/%m/%Y'))
+            i4.metric("DO (nova)",  camp_aj['do_'].strftime('%d/%m/%Y'))
+
+    # Lista de ajustes ativos
+    if ajustes:
+        st.markdown('<div class="sec">Ajustes ativos</div>', unsafe_allow_html=True)
+        for aid, av in ajustes.items():
+            camp_row = df[df['id']==aid]
+            nome = camp_row.iloc[0]['campanha'] if not camp_row.empty else str(aid)
+            st.markdown(
+                f"**{nome}** · SD: {av.get('sd','—')} · ED: {av.get('ed','—')} · "
+                f"Est: {fn(av.get('estoque',0))} · FC: {fn(av.get('forecast',0))}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DADOS
+# ══════════════════════════════════════════════════════════════════════════════
+with t_dados:
+    st.markdown("#### Arquivo carregado")
+    g1,g2,g3 = st.columns(3)
+    g1.metric("Total campanhas ODP", len(df))
+    g2.metric("Campanhas ON", len(df_on))
+    g3.metric("Referência", data_ref.strftime('%d/%m/%Y'))
+
+    st.markdown('<div class="sec">Resumo por status</div>', unsafe_allow_html=True)
+    resumo = (df.groupby('status_op')
+                .agg(campanhas=('id','count'),
+                     estoque_total=('estoque','sum'),
+                     pallets_total=('pallets','sum'))
+                .reset_index()
+                .rename(columns={'status_op':'Status','campanhas':'Campanhas',
+                                  'estoque_total':'Estoque Total','pallets_total':'Pallets'}))
+    st.dataframe(resumo, use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="sec">Todas as campanhas</div>', unsafe_allow_html=True)
+    vis = df[['id','campanha','status_op','cat','cd','sd','ed','wd',
+              'estoque','pallets','forecast','so_cong','reforecast','novo_so']].copy()
+    vis.columns = ['ID','Campanha','Status','Categoria','CD','SD','ED','WD',
+                   'Estoque','Pallets','Forecast','SO Cong.','Reforecast','Novo SO']
+    st.dataframe(vis, use_container_width=True, hide_index=True)
+    st.download_button("⬇ Exportar todas (.csv)",
+        vis.to_csv(index=False,sep=';').encode('utf-8-sig'),
+        "campanhas_odp.csv","text/csv")
