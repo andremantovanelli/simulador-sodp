@@ -1,869 +1,553 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
 from datetime import date, timedelta
-import io
+import io, sys, os
+sys.path.insert(0, '/home/claude')
+from odp_parser import (carregar_odp, gerar_serie_blocado,
+                         gerar_serie_saidas, carregar_curvas,
+                         get_curva, FERIADOS)
+from openpyxl import load_workbook
 
-st.set_page_config(page_title="Simulador ODP — Privalia", page_icon="📦", layout="wide")
+st.set_page_config(
+    page_title="ODP · Privalia",
+    page_icon="📦",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# UTILITÁRIOS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Tema ──────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 
-def parse_br(s):
-    if pd.api.types.is_numeric_dtype(s): return pd.to_numeric(s, errors='coerce')
-    return pd.to_numeric(s.astype(str).str.replace('.','',regex=False).str.replace(',','.',regex=False), errors='coerce')
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+.block-container { padding: 1.5rem 2rem 2rem; }
 
-def proximos_dias_uteis(data_base, n_dias, feriados_set):
-    """Retorna a data resultante de avançar/recuar n_dias úteis (sem fim de semana ou feriado)."""
-    step = 1 if n_dias >= 0 else -1
-    restante = abs(n_dias)
-    d = data_base
-    while restante > 0:
-        d += timedelta(days=step)
-        if d.weekday() < 5 and d not in feriados_set:
-            restante -= 1
-    return d
+/* tabs */
+[data-baseweb="tab-list"] { gap: 0; border-bottom: 1px solid #e5e7eb; }
+[data-baseweb="tab"] { 
+    font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 500;
+    padding: 10px 18px; color: #6b7280;
+}
+[aria-selected="true"] { color: #111827 !important; border-bottom: 2px solid #111827 !important; }
 
-def calcular_datas_blocado(data_inicio, data_fim, feriados_set, dn_manual=None, do_manual=None):
-    dn = dn_manual if dn_manual else proximos_dias_uteis(data_inicio, -2, feriados_set)
-    do = do_manual if do_manual else proximos_dias_uteis(data_fim, 3, feriados_set)
-    return dn, do
+/* métricas */
+[data-testid="metric-container"] { 
+    background: #f9fafb; border-radius: 10px; padding: 16px 20px;
+    border: 1px solid #f3f4f6;
+}
+[data-testid="stMetricValue"] { font-size: 26px !important; font-weight: 600; }
+[data-testid="stMetricLabel"] { font-size: 12px !important; color: #6b7280; }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CARREGAMENTO
-# ═══════════════════════════════════════════════════════════════════════════════
+/* tabela */
+[data-testid="stDataFrame"] { font-size: 12px; }
 
-@st.cache_data
-def carregar_calendario(f):
-    df = pd.read_excel(f).rename(columns={
-        'Id externo de Campanha Sacarino':'id_campanha','Nome da campanha':'campanha',
-        'Data de início':'data_inicio','Data de término':'data_fim',
-        'Webdays':'webdays','Status':'status','Centro de distibuição':'cd',
-        'Categoria':'categoria','Sector Calendar':'setor',
-        'Previsão de venda peças':'previsao_pecas','Estoque Total':'estoque_total',
-        'Modelo de negócio':'modelo_negocio','Gerência':'gerencia',
-    })
-    df['data_inicio'] = pd.to_datetime(df['data_inicio'], dayfirst=True, errors='coerce')
-    df['data_fim']    = pd.to_datetime(df['data_fim'],    dayfirst=True, errors='coerce')
-    cols = ['id_campanha','campanha','data_inicio','data_fim','webdays','status',
-            'cd','categoria','setor','previsao_pecas','estoque_total','modelo_negocio','gerencia']
-    df = df[[c for c in cols if c in df.columns]].drop_duplicates(subset=['id_campanha'])
-    df = df[df['modelo_negocio'].str.upper().str.strip() == 'ODP'].dropna(subset=['data_inicio','data_fim'])
-    df['webdays'] = pd.to_numeric(df['webdays'], errors='coerce').fillna(1).clip(lower=1)
-    df['previsao_pecas'] = pd.to_numeric(df['previsao_pecas'], errors='coerce').fillna(0)
-    df['estoque_total']  = pd.to_numeric(df['estoque_total'],  errors='coerce').fillna(0)
-    return df
+/* expander */
+[data-testid="stExpander"] { border: 1px solid #f3f4f6 !important; border-radius: 10px; }
 
-@st.cache_data
-def carregar_vendas(f):
-    df = pd.read_csv(f, sep=';', dtype=str)
-    df.columns = [c.strip() for c in df.columns]
-    df = df.rename(columns={'ID':'id_campanha','Dia_Click':'data_venda',
-                             'Items':'pecas_vendidas','Orders':'pedidos','Revenue':'receita'})
-    if 'id_campanha' in df.columns:
-        df['id_campanha'] = pd.to_numeric(df['id_campanha'].str.replace('.','',regex=False), errors='coerce')
-    if 'data_venda' in df.columns:
-        df['data_venda'] = pd.to_datetime(df['data_venda'], dayfirst=True, errors='coerce')
-    for c in ['pecas_vendidas','pedidos','receita']:
-        if c in df.columns: df[c] = parse_br(df[c])
-    return df
+/* badges */
+.badge-on  { background:#dcfce7; color:#166534; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+.badge-x   { background:#f3f4f6; color:#6b7280; padding:2px 8px; border-radius:4px; font-size:11px; }
+.badge-fut { background:#eff6ff; color:#1d4ed8; padding:2px 8px; border-radius:4px; font-size:11px; }
+.alerta    { background:#fef2f2; color:#991b1b; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
 
-@st.cache_data
-def carregar_odp_vertical(f):
-    df = pd.read_excel(f)
-    cols = ['ID campanha','Nome','Categoria','Peças','Peças Convertidas','Status','Data']
-    df = df[[c for c in cols if c in df.columns]].rename(columns={
-        'ID campanha':'id_campanha','Nome':'campanha','Categoria':'categoria',
-        'Peças':'pecas','Peças Convertidas':'pecas_convertidas',
-        'Status':'status_entrada','Data':'data_entrada'})
-    df['data_entrada'] = pd.to_datetime(df['data_entrada'], errors='coerce')
-    return df.dropna(subset=['data_entrada'])
+.titulo-sec { font-size: 11px; font-weight: 600; color: #9ca3af; 
+              text-transform: uppercase; letter-spacing: .06em; margin: 20px 0 10px; }
+</style>
+""", unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PARÂMETROS PADRÃO (da aba Suporte)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def fmt_n(v, dec=0):
+    if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
+    return f"{v:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-PARAMS_DEFAULT = {
-    'conversoes': pd.DataFrame([
-        {'categoria':'Fashion',             'fator_in':1.0,  'fator_out':1.0},
-        {'categoria':'Shoes',               'fator_in':2.0,  'fator_out':2.5},
-        {'categoria':'Kids',                'fator_in':0.741,'fator_out':1.0},
-        {'categoria':'Baby',                'fator_in':0.741,'fator_out':1.0},
-        {'categoria':'Sport',               'fator_in':1.0,  'fator_out':1.0},
-        {'categoria':'Underwear',           'fator_in':0.667,'fator_out':1.0},
-        {'categoria':'Beachwear',           'fator_in':0.667,'fator_out':1.0},
-        {'categoria':'Home & Decor',        'fator_in':2.5,  'fator_out':2.632},
-        {'categoria':'Beauty and Wellness', 'fator_in':2.5,  'fator_out':2.632},
-        {'categoria':'Eyewear',             'fator_in':1.667,'fator_out':2.632},
-        {'categoria':'Bags',                'fator_in':2.0,  'fator_out':2.632},
-        {'categoria':'Clearance',           'fator_in':1.0,  'fator_out':1.0},
-    ]),
-    'pallets': pd.DataFrame([
-        {'categoria':'Acessories',      'pecas_palete':921},
-        {'categoria':'Baby',            'pecas_palete':451},
-        {'categoria':'Babycare',        'pecas_palete':451},
-        {'categoria':'Beachwear',       'pecas_palete':401},
-        {'categoria':'Beauty',          'pecas_palete':260},
-        {'categoria':'Bodywear',        'pecas_palete':498},
-        {'categoria':'Clearance',       'pecas_palete':150},
-        {'categoria':'Fashion',         'pecas_palete':400},
-        {'categoria':'Fitness',         'pecas_palete':401},
-        {'categoria':'Kids I',          'pecas_palete':421},
-        {'categoria':'Kids II',         'pecas_palete':405},
-        {'categoria':'Kids Brands',     'pecas_palete':405},
-        {'categoria':'Kids Shoes',      'pecas_palete':135},
-        {'categoria':'Kids Trends',     'pecas_palete':421},
-        {'categoria':'Shoes I',         'pecas_palete':97},
-        {'categoria':'Shoes II',        'pecas_palete':109},
-        {'categoria':'Shoes III',       'pecas_palete':107},
-        {'categoria':'Shoes Brands',    'pecas_palete':97},
-        {'categoria':'Shoes Comfort',   'pecas_palete':108},
-        {'categoria':'Shoes Trends',    'pecas_palete':107},
-        {'categoria':'Sports',          'pecas_palete':396},
-        {'categoria':'Sul Brands',      'pecas_palete':408},
-        {'categoria':'Sul Trends',      'pecas_palete':396},
-        {'categoria':'Underwear',       'pecas_palete':596},
-        {'categoria':'Varejo Feminino', 'pecas_palete':336},
-        {'categoria':'Varejo Masculino','pecas_palete':377},
-    ]),
-    'feriados': pd.DataFrame([
-        {'data':date(2024,1,1),  'nome':'Ano Novo',             'local':'Nacional'},
-        {'data':date(2024,2,12), 'nome':'Carnaval',             'local':'Nacional'},
-        {'data':date(2024,2,13), 'nome':'Carnaval',             'local':'Nacional'},
-        {'data':date(2024,3,29), 'nome':'Sexta-feira Santa',    'local':'Nacional'},
-        {'data':date(2024,4,21), 'nome':'Tiradentes',           'local':'Nacional'},
-        {'data':date(2024,5,1),  'nome':'Dia do Trabalho',      'local':'Nacional'},
-        {'data':date(2024,5,30), 'nome':'Corpus Christi',       'local':'Nacional'},
-        {'data':date(2024,7,9),  'nome':'Revolução Constit.',   'local':'SP'},
-        {'data':date(2024,9,7),  'nome':'Independência',        'local':'Nacional'},
-        {'data':date(2024,10,12),'nome':'Nossa Senhora',        'local':'Nacional'},
-        {'data':date(2024,11,2), 'nome':'Finados',              'local':'Nacional'},
-        {'data':date(2024,11,15),'nome':'Proclamação República','local':'Nacional'},
-        {'data':date(2024,11,20),'nome':'Consciência Negra',    'local':'SP'},
-        {'data':date(2024,11,29),'nome':'Black Friday',         'local':'Nacional'},
-        {'data':date(2024,12,25),'nome':'Natal',                'local':'Nacional'},
-        {'data':date(2025,1,1),  'nome':'Ano Novo',             'local':'Nacional'},
-        {'data':date(2025,3,3),  'nome':'Carnaval',             'local':'Nacional'},
-        {'data':date(2025,3,4),  'nome':'Carnaval',             'local':'Nacional'},
-        {'data':date(2025,4,18), 'nome':'Sexta-feira Santa',    'local':'Nacional'},
-        {'data':date(2025,4,21), 'nome':'Tiradentes',           'local':'Nacional'},
-        {'data':date(2025,5,1),  'nome':'Dia do Trabalho',      'local':'Nacional'},
-        {'data':date(2025,6,19), 'nome':'Corpus Christi',       'local':'Nacional'},
-        {'data':date(2025,9,7),  'nome':'Independência',        'local':'Nacional'},
-        {'data':date(2025,10,12),'nome':'Nossa Senhora',        'local':'Nacional'},
-        {'data':date(2025,11,2), 'nome':'Finados',              'local':'Nacional'},
-        {'data':date(2025,11,15),'nome':'Proclamação República','local':'Nacional'},
-        {'data':date(2025,11,20),'nome':'Consciência Negra',    'local':'SP'},
-        {'data':date(2025,12,25),'nome':'Natal',                'local':'Nacional'},
-        {'data':date(2026,1,1),  'nome':'Ano Novo',             'local':'Nacional'},
-        {'data':date(2026,2,16), 'nome':'Carnaval',             'local':'Nacional'},
-        {'data':date(2026,2,17), 'nome':'Carnaval',             'local':'Nacional'},
-        {'data':date(2026,4,3),  'nome':'Sexta-feira Santa',    'local':'Nacional'},
-        {'data':date(2026,4,21), 'nome':'Tiradentes',           'local':'Nacional'},
-        {'data':date(2026,5,1),  'nome':'Dia do Trabalho',      'local':'Nacional'},
-        {'data':date(2026,6,4),  'nome':'Corpus Christi',       'local':'Nacional'},
-        {'data':date(2026,9,7),  'nome':'Independência',        'local':'Nacional'},
-        {'data':date(2026,10,12),'nome':'Nossa Senhora',        'local':'Nacional'},
-        {'data':date(2026,11,2), 'nome':'Finados',              'local':'Nacional'},
-        {'data':date(2026,11,15),'nome':'Proclamação República','local':'Nacional'},
-        {'data':date(2026,11,20),'nome':'Consciência Negra',    'local':'SP'},
-        {'data':date(2026,12,25),'nome':'Natal',                'local':'Nacional'},
-    ]),
-    'lead_times': {'wlt': 1, 'dlt': 3},
-    'curva_venda': pd.DataFrame([
-        {'categoria':'Fashion', 'webdays':7,  'd1':0.156,'d2':0.290,'d3':0.155,'d4':0.118,'d5':0.096,'d6':0.087,'d7':0.098},
-        {'categoria':'Fashion', 'webdays':8,  'd1':0.075,'d2':0.252,'d3':0.173,'d4':0.140,'d5':0.111,'d6':0.095,'d7':0.086,'d8':0.090},
-        {'categoria':'Fashion', 'webdays':9,  'd1':0.042,'d2':0.225,'d3':0.121,'d4':0.134,'d5':0.086,'d6':0.123,'d7':0.104,'d8':0.083,'d9':0.081},
-        {'categoria':'Shoes',   'webdays':7,  'd1':0.104,'d2':0.361,'d3':0.165,'d4':0.124,'d5':0.097,'d6':0.077,'d7':0.072},
-        {'categoria':'Shoes',   'webdays':8,  'd1':0.043,'d2':0.272,'d3':0.161,'d4':0.134,'d5':0.120,'d6':0.090,'d7':0.087,'d8':0.093},
-        {'categoria':'Shoes',   'webdays':9,  'd1':0.045,'d2':0.259,'d3':0.150,'d4':0.122,'d5':0.099,'d6':0.088,'d7':0.074,'d8':0.080,'d9':0.083},
-        {'categoria':'Kids',    'webdays':7,  'd1':0.108,'d2':0.344,'d3':0.189,'d4':0.143,'d5':0.086,'d6':0.062,'d7':0.068},
-        {'categoria':'Kids',    'webdays':8,  'd1':0.025,'d2':0.228,'d3':0.163,'d4':0.131,'d5':0.114,'d6':0.121,'d7':0.115,'d8':0.103},
-        {'categoria':'Kids',    'webdays':9,  'd1':0.057,'d2':0.270,'d3':0.181,'d4':0.103,'d5':0.088,'d6':0.083,'d7':0.076,'d8':0.074,'d9':0.068},
-        {'categoria':'Sports',  'webdays':7,  'd1':0.069,'d2':0.372,'d3':0.152,'d4':0.099,'d5':0.108,'d6':0.097,'d7':0.100},
-        {'categoria':'Sports',  'webdays':8,  'd1':0.112,'d2':0.329,'d3':0.144,'d4':0.099,'d5':0.090,'d6':0.082,'d7':0.071,'d8':0.072},
-        {'categoria':'Sports',  'webdays':9,  'd1':0.088,'d2':0.283,'d3':0.134,'d4':0.105,'d5':0.095,'d6':0.070,'d7':0.081,'d8':0.072,'d9':0.071},
-    ]),
+def fmt_pct(v, dec=1):
+    if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
+    return f"{v*100:.{dec}f}%"
+
+def cor_desvio(v):
+    if abs(v) < 0.05: return "#16a34a"
+    if abs(v) < 0.15: return "#d97706"
+    return "#dc2626"
+
+CAP_BU = 4200        # pallets capacidade armazenagem BU
+CAP_CHECKIN = 50000  # peças/dia check-in Extrema
+CAP_CHECKOUT = 45000 # peças/dia check-out Extrema
+
+CORES_TIPO = {
+    'realizado': '#1e3a5f',
+    'reforecast': '#3b82f6',
+    'previsto':   '#bfdbfe',
 }
 
-def get_params():
-    if 'params' not in st.session_state:
-        st.session_state['params'] = {
-            'conversoes': PARAMS_DEFAULT['conversoes'].copy(),
-            'pallets':    PARAMS_DEFAULT['pallets'].copy(),
-            'feriados':   PARAMS_DEFAULT['feriados'].copy(),
-            'lead_times': PARAMS_DEFAULT['lead_times'].copy(),
-            'curva_venda':PARAMS_DEFAULT['curva_venda'].copy(),
-        }
-    return st.session_state['params']
+# ── Carregamento de dados ─────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def carregar(arquivo_bytes, nome_arquivo):
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.xlsm', delete=False) as tmp:
+        tmp.write(arquivo_bytes)
+        tmp_path = tmp.name
+    df = carregar_odp(tmp_path)
+    os.unlink(tmp_path)
+    return df
 
-def get_feriados_set(cd='Extrema'):
-    params = get_params()
-    df = params['feriados']
-    locais_validos = ['Nacional']
-    if 'extrema' in cd.lower():  locais_validos.append('Extrema'); locais_validos.append('SP')
-    if 'jandira' in cd.lower():  locais_validos.append('Jandira'); locais_validos.append('SP')
-    return set(df[df['local'].isin(locais_validos)]['data'].tolist())
+# ── Estado da sessão ──────────────────────────────────────────────────────────
+if 'df' not in st.session_state:
+    st.session_state.df = None
+if 'data_ref' not in st.session_state:
+    st.session_state.data_ref = date.today()
 
-def get_fator(categoria, tipo, params):
-    """Busca fator de conversão IN ou OUT para a categoria."""
-    df = params['conversoes']
-    row = df[df['categoria'].str.lower() == str(categoria).lower()]
-    if row.empty:
-        # tenta match parcial
-        for _, r in df.iterrows():
-            if r['categoria'].lower() in str(categoria).lower():
-                return r[f'fator_{tipo}']
-        return 1.0
-    return float(row.iloc[0][f'fator_{tipo}'])
+# ── Header ────────────────────────────────────────────────────────────────────
+col_logo, col_ref, col_up = st.columns([3, 2, 2])
+with col_logo:
+    st.markdown("### ODP &nbsp;·&nbsp; Privalia")
+with col_ref:
+    if st.session_state.df is not None:
+        dr = st.session_state.data_ref
+        st.markdown(f"<span style='font-size:13px;color:#6b7280'>ref. {dr.strftime('%d/%m/%Y')}</span>",
+                    unsafe_allow_html=True)
+with col_up:
+    uploaded = st.file_uploader("", type=['xlsm','xlsx'], label_visibility='collapsed',
+                                 key='uploader')
+    if uploaded:
+        with st.spinner("Lendo simulador..."):
+            df_novo = carregar(uploaded.read(), uploaded.name)
+            st.session_state.df = df_novo
+            if not df_novo.empty:
+                st.session_state.data_ref = df_novo['data_ref'].iloc[0]
+        st.rerun()
 
-def get_pecas_palete(categoria, params):
-    df = params['pallets']
-    row = df[df['categoria'].str.lower() == str(categoria).lower()]
-    if row.empty:
-        for _, r in df.iterrows():
-            if r['categoria'].lower() in str(categoria).lower():
-                return float(r['pecas_palete'])
-        return 400.0
-    return float(row.iloc[0]['pecas_palete'])
+st.markdown("<hr style='margin:0 0 16px;border:none;border-top:1px solid #f3f4f6'>",
+            unsafe_allow_html=True)
 
-def get_curva(categoria, webdays, params):
-    """Retorna lista de pesos por dia relativo."""
-    df = params['curva_venda']
-    wd = int(webdays)
-    row = df[(df['categoria'].str.lower() == str(categoria).lower()) & (df['webdays'] == wd)]
-    if row.empty:
-        # fallback: distribuição uniforme
-        return [1.0/wd]*wd
-    cols_d = [f'd{i}' for i in range(1, wd+1) if f'd{i}' in row.columns]
-    vals = [float(row.iloc[0][c]) for c in cols_d]
-    total = sum(vals)
-    return [v/total for v in vals] if total > 0 else [1.0/wd]*wd
+# ── Sem dados ─────────────────────────────────────────────────────────────────
+df = st.session_state.df
+if df is None or df.empty:
+    st.info("Faça upload do Simulador ODP (.xlsm) para começar.")
+    st.stop()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MOTOR DE CÁLCULO
-# ═══════════════════════════════════════════════════════════════════════════════
+data_ref  = st.session_state.data_ref
+ontem     = data_ref - timedelta(days=1)
 
-def calcular_saidas(calendario, vendas, data_hoje, params, ajustes=None):
-    """
-    Para cada campanha ODP, gera volume de saída (picking) por dia.
-    Usa curva de venda histórica para distribuir a previsão.
-    """
-    if ajustes is None: ajustes = {}
-    linhas = []
-    for _, camp in calendario.iterrows():
-        cid = camp['id_campanha']
-        aj  = ajustes.get(cid, {})
+# partições principais
+df_on    = df[df['status'] == 'ON'].copy()
+df_ontem = df[(df['status'] == 'x') & (df['ed'].dt.date == ontem)].copy()
+df_fut   = df[df['status'] == '-'].copy()
 
-        inicio   = aj.get('data_inicio', camp['data_inicio'].date())
-        fim      = aj.get('data_fim',    camp['data_fim'].date())
-        webdays  = max(int((fim - inicio).days + 1), 1)
-        prev_tot = aj.get('previsao_pecas', camp['previsao_pecas'])
-        cat      = camp['categoria']
-
-        curva = get_curva(cat, webdays, params)
-        fator_out = get_fator(cat, 'out', params)
-
-        vendas_camp = pd.DataFrame()
-        if vendas is not None and 'id_campanha' in vendas.columns:
-            vendas_camp = vendas[vendas['id_campanha'] == cid].copy()
-
-        datas = [inicio + timedelta(days=i) for i in range(webdays)]
-        for idx, d in enumerate(datas):
-            peso = curva[idx] if idx < len(curva) else (1.0/webdays)
-            prev_dia = prev_tot * peso
-
-            if d < data_hoje:
-                if not vendas_camp.empty and 'data_venda' in vendas_camp.columns:
-                    vd = vendas_camp[vendas_camp['data_venda'].dt.date == d]
-                    pecas_bruto = float(vd['pecas_vendidas'].sum()) if not vd.empty else prev_dia
-                else:
-                    pecas_bruto = prev_dia
-                tipo = 'realizado'
-            elif d == data_hoje:
-                if not vendas_camp.empty and 'data_venda' in vendas_camp.columns:
-                    vd = vendas_camp[vendas_camp['data_venda'].dt.date == d]
-                    pecas_bruto = float(vd['pecas_vendidas'].sum()) if not vd.empty else prev_dia
-                else:
-                    pecas_bruto = prev_dia
-                tipo = 'reforecast'
-            else:
-                pecas_bruto = prev_dia
-                tipo = 'previsao'
-
-            linhas.append({
-                'id_campanha': cid,
-                'campanha':    camp['campanha'],
-                'data':        d,
-                'gerencia':    camp.get('gerencia',''),
-                'categoria':   cat,
-                'cd':          camp.get('cd',''),
-                'pecas_bruto': round(pecas_bruto, 1),
-                'pecas_conv':  round(pecas_bruto * fator_out, 1),
-                'tipo':        tipo,
-            })
-    return pd.DataFrame(linhas)
-
-def calcular_blocado(calendario, data_hoje, params, ajustes=None):
-    """
-    Calcula o saldo do estoque blocado (horizontal/picking) por dia.
-    Entra na DN, permanece integral, sai na DO.
-    """
-    if ajustes is None: ajustes = {}
-    linhas = []
-    for _, camp in calendario.iterrows():
-        cid   = camp['id_campanha']
-        aj    = ajustes.get(cid, {})
-        cd    = camp.get('cd', 'Extrema')
-        cat   = camp['categoria']
-        feriados = get_feriados_set(cd)
-
-        inicio = aj.get('data_inicio', camp['data_inicio'].date())
-        fim    = aj.get('data_fim',    camp['data_fim'].date())
-        est    = aj.get('estoque_total', camp['estoque_total'])
-
-        dn = aj.get('dn', None)
-        do = aj.get('do', None)
-        dn, do = calcular_datas_blocado(inicio, fim, feriados, dn, do)
-
-        fator_in  = get_fator(cat, 'in', params)
-        ppp       = get_pecas_palete(cat, params)
-        est_conv  = est * fator_in
-        pallets   = est_conv / ppp if ppp > 0 else 0
-
-        linhas.append({
-            'id_campanha': cid,
-            'campanha':    camp['campanha'],
-            'categoria':   cat,
-            'cd':          cd,
-            'gerencia':    camp.get('gerencia',''),
-            'data_inicio': inicio,
-            'data_fim':    fim,
-            'dn':          dn,
-            'do':          do,
-            'estoque_pecas': round(est, 0),
-            'estoque_conv':  round(est_conv, 0),
-            'pallets':       round(pallets, 2),
-            'status':        'blocado' if dn <= data_hoje <= do else (
-                             'aguardando' if data_hoje < dn else 'liberado'),
-        })
-    df = pd.DataFrame(linhas)
-    if df.empty: return df, pd.DataFrame()
-
-    # Série temporal: saldo dia a dia
-    if df.empty: return df, pd.DataFrame()
-    min_d = df['dn'].min()
-    max_d = df['do'].max()
-    datas = pd.date_range(min_d, max_d).date
-    serie = []
-    for d in datas:
-        ativas = df[(df['dn'] <= d) & (df['do'] >= d)]
-        serie.append({
-            'data':       d,
-            'pecas':      ativas['estoque_pecas'].sum(),
-            'pecas_conv': ativas['estoque_conv'].sum(),
-            'pallets':    ativas['pallets'].sum(),
-            'campanhas':  len(ativas),
-        })
-    return df, pd.DataFrame(serie)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# INTERFACE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.title("Simulador ODP — Privalia")
-
-# Session state para ajustes de simulação
-if 'ajustes' not in st.session_state: st.session_state['ajustes'] = {}
-
-# ── Abas ──────────────────────────────────────────────────────────────────────
-aba_dados, aba_saidas, aba_blocado, aba_reforecast, aba_sim, aba_params, aba_export = st.tabs([
-    "Dados", "Saídas", "Blocado", "Reforecast", "Simulações", "Parâmetros", "Exportar"
+# ── ABAS ─────────────────────────────────────────────────────────────────────
+aba_dash, aba_saidas, aba_blocado, aba_rfcst, aba_dados = st.tabs([
+    "Dashboard", "Saídas", "Blocado", "Reforecast", "Dados"
 ])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA DADOS
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_dados:
-    st.subheader("Carregar dados")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        arq_cal  = st.file_uploader("Calendário Salesforce (.xlsx)", type=["xlsx","xls"])
-    with col2:
-        arq_vend = st.file_uploader("Base de vendas DBeaver (.csv)", type=["csv"])
-    with col3:
-        arq_odp  = st.file_uploader("ODP Vertical (.xlsx)", type=["xlsx","xls"])
+# ═════════════════════════════════════════════════════════════════════════════
+# ABA 1 — DASHBOARD
+# ═════════════════════════════════════════════════════════════════════════════
+with aba_dash:
 
-    st.divider()
-    col_a, col_b = st.columns(2)
-    with col_a:
-        data_hoje = st.date_input("Data de referência (hoje)", value=date.today())
-    with col_b:
-        cds_opcoes = ["Extrema", "Jandira", "Extrema e Jandira"]
-        sel_cd_global = st.selectbox("Centro de distribuição", cds_opcoes)
+    # ── Métricas de topo ──────────────────────────────────────────────────────
+    pal_hoje = df_on['pallets'].sum() + df_ontem['pallets'].sum()
+    alertas  = df_on[df_on['desvio_abs'].abs() > 0.15]
 
-    if arq_cal:
-        cal = carregar_calendario(arq_cal)
-        st.success(f"Calendário: {len(cal)} campanhas ODP carregadas")
-        with st.expander("Prévia"):
-            st.dataframe(cal.head(10), use_container_width=True, hide_index=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Campanhas ON agora",   len(df_on))
+    m2.metric("Encerradas ontem",     len(df_ontem))
+    m3.metric("Pallets blocados hoje",fmt_n(pal_hoje),
+              delta=f"{pal_hoje/CAP_BU*100:.0f}% da cap. BU",
+              delta_color="off")
+    m4.metric("Com desvio > ±15 p.p.",len(alertas),
+              delta="requerem atenção" if len(alertas) else "tudo dentro do esperado",
+              delta_color="inverse" if len(alertas) else "off")
 
-    if arq_vend:
-        try:
-            vendas = carregar_vendas(arq_vend)
-            st.success(f"Vendas: {len(vendas):,} registros")
-        except Exception as e:
-            st.error(f"Erro vendas: {e}")
-            vendas = None
+    # ── Campanhas ativas ──────────────────────────────────────────────────────
+    st.markdown('<div class="titulo-sec">Campanhas ativas agora</div>', unsafe_allow_html=True)
+    _mostrar_encerradas = st.checkbox("Incluir encerradas ontem", value=False, key='dash_enc')
+    df_view = pd.concat([df_on, df_ontem]) if _mostrar_encerradas else df_on
 
-    if arq_odp:
-        try:
-            odp_vert = carregar_odp_vertical(arq_odp)
-            st.success(f"ODP Vertical: {len(odp_vert):,} registros")
-        except Exception as e:
-            st.error(f"Erro ODP: {e}")
+    for _, camp in df_view.sort_values('ed').iterrows():
+        badge = ('badge-on'  if camp['status'] == 'ON'
+                 else 'badge-x')
+        alerta_str = ""
+        if abs(camp['desvio_abs']) > 0.15:
+            sinal = "+" if camp['desvio_abs'] > 0 else ""
+            alerta_str = f'<span class="alerta">⚑ {sinal}{camp["desvio_abs"]*100:.1f} p.p.</span>'
 
-# Guarda no session state para usar em outras abas
-if arq_cal is not None:
-    st.session_state['cal']        = carregar_calendario(arq_cal)
-    st.session_state['data_hoje']  = data_hoje
-    st.session_state['sel_cd']     = sel_cd_global
-
-cal_ok   = 'cal' in st.session_state
-data_ref = st.session_state.get('data_hoje', date.today())
-ajustes  = st.session_state.get('ajustes', {})
-params   = get_params()
-
-def filtrar_cd(df, col='cd'):
-    sel = st.session_state.get('sel_cd','Extrema e Jandira')
-    if sel == 'Extrema e Jandira': return df
-    return df[df[col].str.lower().str.contains(sel.lower(), na=False)] if col in df.columns else df
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA SAÍDAS
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_saidas:
-    if not cal_ok:
-        st.info("Carregue o calendário na aba Dados.")
-    else:
-        cal = st.session_state['cal']
-        vendas = None
-        if arq_vend is not None:
-            try: vendas = carregar_vendas(arq_vend)
-            except: pass
-
-        # Filtros
-        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-        with col_f1:
-            conv_saida = st.radio("Unidade", ["Não convertido","Convertido"], horizontal=True,
-                                  help="Convertido aplica fator OUT por categoria")
-        with col_f2:
-            gers  = sorted(cal['gerencia'].dropna().unique().tolist())
-            sel_ger = st.multiselect("Gerência", gers, default=gers, key='sai_ger')
-        with col_f3:
-            cats  = sorted(cal['categoria'].dropna().unique().tolist())
-            sel_cat = st.multiselect("Categoria", cats, default=cats, key='sai_cat')
-        with col_f4:
-            tipos_vis = st.multiselect("Tipo", ["realizado","reforecast","previsao"],
-                                       default=["realizado","reforecast","previsao"], key='sai_tipo')
-
-        params_vis = get_params()
-        data_ini_vis = params_vis.get('data_ini_vis', date(2025, 5, 1))
-        data_fim_vis = params_vis.get('data_fim_vis', date(2025, 7, 30))
-
-        cal_f = filtrar_cd(cal)
-        cal_f = cal_f[
-            (cal_f['data_inicio'].dt.date <= data_fim_vis) &
-            (cal_f['data_fim'].dt.date    >= data_ini_vis) &
-            cal_f['gerencia'].isin(sel_ger) &
-            cal_f['categoria'].isin(sel_cat)
-        ]
-
-        with st.spinner("Calculando saídas..."):
-            df_sai = calcular_saidas(cal_f, vendas, data_ref, params, ajustes)
-
-        if df_sai.empty:
-            st.warning("Nenhum dado para os filtros selecionados.")
-        else:
-            col_pecas = 'pecas_conv' if conv_saida == 'Convertido' else 'pecas_bruto'
-            df_vis = df_sai[df_sai['tipo'].isin(tipos_vis)]
-
-            # Métricas
-            m1,m2,m3,m4 = st.columns(4)
-            total = df_vis[col_pecas].sum()
-            real  = df_vis[df_vis['tipo']=='realizado'][col_pecas].sum()
-            prev  = df_vis[df_vis['tipo'].isin(['reforecast','previsao'])][col_pecas].sum()
-            m1.metric("Total peças", f"{total:,.0f}".replace(',','.'))
-            m2.metric("Realizado",   f"{real:,.0f}".replace(',','.'))
-            m3.metric("A realizar",  f"{prev:,.0f}".replace(',','.'))
-            m4.metric("Campanhas",   str(df_vis['id_campanha'].nunique()))
-
-            st.subheader("Volume de picking por dia")
-            pivot = (df_vis.groupby(['data','tipo'])[col_pecas].sum().reset_index()
-                     .pivot_table(index='data',columns='tipo',values=col_pecas,aggfunc='sum')
-                     .fillna(0).sort_index())
-            pivot.index = pd.to_datetime(pivot.index)
-            pivot.columns.name = None
-            pivot = pivot.rename(columns={'realizado':'Realizado','reforecast':'Reforecast','previsao':'Previsão'})
-            st.bar_chart(pivot, use_container_width=True)
-
-            st.subheader("Por gerência")
-            por_ger = (df_vis.groupby(['gerencia','tipo'])[col_pecas].sum().reset_index()
-                       .pivot_table(index='gerencia',columns='tipo',values=col_pecas,aggfunc='sum')
-                       .fillna(0).reset_index())
-            por_ger.columns.name = None
-            for c in ['realizado','reforecast','previsao']:
-                if c in por_ger.columns: por_ger[c] = por_ger[c].round(0).astype(int)
-            por_ger = por_ger.rename(columns={'gerencia':'Gerência','realizado':'Realizado',
-                                               'reforecast':'Reforecast','previsao':'Previsão'})
-            st.dataframe(por_ger, use_container_width=True, hide_index=True)
-
-            st.subheader("Por campanha")
-            por_camp = (df_vis.groupby(['id_campanha','campanha','categoria','cd'])[col_pecas].sum()
-                        .reset_index().sort_values(col_pecas, ascending=False))
-            por_camp[col_pecas] = por_camp[col_pecas].round(0).astype(int)
-            por_camp = por_camp.rename(columns={'id_campanha':'ID','campanha':'Campanha',
-                                                'categoria':'Categoria','cd':'CD',
-                                                col_pecas:'Peças'})
-            st.dataframe(por_camp, use_container_width=True, hide_index=True)
-
-            with st.expander("Detalhe diário por campanha"):
-                det = df_vis[['data','campanha','tipo',col_pecas]].copy()
-                det['data'] = det['data'].astype(str)
-                det[col_pecas] = det[col_pecas].round(1)
-                det = det.rename(columns={'data':'Data','campanha':'Campanha',
-                                          'tipo':'Tipo',col_pecas:'Peças'})
-                st.dataframe(det, use_container_width=True, hide_index=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA BLOCADO
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_blocado:
-    if not cal_ok:
-        st.info("Carregue o calendário na aba Dados.")
-    else:
-        cal = st.session_state['cal']
-        params_vis2 = get_params()
-        data_ini_vis2 = params_vis2.get('data_ini_vis', date(2025, 5, 1))
-        data_fim_vis2 = params_vis2.get('data_fim_vis', date(2025, 7, 30))
-
-        cal_f = filtrar_cd(cal)
-        cal_f = cal_f[
-            (cal_f['data_inicio'].dt.date <= data_fim_vis2) &
-            (cal_f['data_fim'].dt.date    >= data_ini_vis2)
-        ]
-
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            conv_bloc = st.radio("Unidade", ["Peças","Peças convertidas","Pallets"],
-                                 horizontal=True, key='bloc_conv')
-        with col_f2:
-            gers_b = sorted(cal_f['gerencia'].dropna().unique().tolist())
-            sel_ger_b = st.multiselect("Gerência", gers_b, default=gers_b, key='bloc_ger')
-
-        cal_fb = cal_f[cal_f['gerencia'].isin(sel_ger_b)]
-
-        with st.spinner("Calculando blocado..."):
-            df_bloc, serie_bloc = calcular_blocado(cal_fb, data_ref, params, ajustes)
-
-        if df_bloc.empty:
-            st.warning("Nenhum dado de blocado.")
-        else:
-            col_serie = {'Peças':'pecas','Peças convertidas':'pecas_conv','Pallets':'pallets'}[conv_bloc]
-            unidade   = conv_bloc
-
-            # Métricas
-            m1,m2,m3 = st.columns(3)
-            hoje_bloc = df_bloc[df_bloc['status']=='blocado']
-            m1.metric("Campanhas blocadas hoje", str(len(hoje_bloc)))
-            m2.metric(f"{unidade} blocadas hoje",
-                      f"{hoje_bloc[col_serie.replace('pecas','estoque_pecas').replace('pecas_conv','estoque_conv').replace('pallets','pallets')].sum():,.0f}".replace(',','.'))
-            m3.metric("Campanhas aguardando", str(len(df_bloc[df_bloc['status']=='aguardando'])))
-
-            st.subheader(f"Saldo blocado por dia — {unidade}")
-            if not serie_bloc.empty:
-                serie_vis = serie_bloc[['data', col_serie]].set_index('data').rename(columns={col_serie: unidade})
-                serie_vis.index = pd.to_datetime(serie_vis.index)
-                st.line_chart(serie_vis, use_container_width=True)
-
-            st.subheader("Campanhas no picking")
-            exib = df_bloc[['id_campanha','campanha','categoria','cd','gerencia',
-                             'data_inicio','data_fim','dn','do',
-                             'estoque_pecas','estoque_conv','pallets','status']].copy()
-            for c in ['data_inicio','data_fim','dn','do']:
-                exib[c] = exib[c].astype(str)
-            exib['estoque_pecas'] = exib['estoque_pecas'].astype(int)
-            exib['estoque_conv']  = exib['estoque_conv'].astype(int)
-            exib['pallets']       = exib['pallets'].round(2)
-            exib = exib.rename(columns={
-                'id_campanha':'ID','campanha':'Campanha','categoria':'Categoria',
-                'cd':'CD','gerencia':'Gerência','data_inicio':'Início','data_fim':'Fim',
-                'dn':'Data descida','do':'Data subida',
-                'estoque_pecas':'Peças','estoque_conv':'Peças conv.','pallets':'Pallets','status':'Status'})
-            st.dataframe(exib, use_container_width=True, hide_index=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA REFORECAST
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_reforecast:
-    if not cal_ok:
-        st.info("Carregue o calendário na aba Dados.")
-    else:
-        cal = st.session_state['cal']
-        vendas = None
-        if arq_vend is not None:
-            try: vendas = carregar_vendas(arq_vend)
-            except: pass
-
-        params_vis3 = get_params()
-        data_ini_vis3 = params_vis3.get('data_ini_vis', date(2025, 5, 1))
-        data_fim_vis3 = params_vis3.get('data_fim_vis', date(2025, 7, 30))
-        cal_f = filtrar_cd(cal)
-        cal_f = cal_f[
-            (cal_f['data_inicio'].dt.date <= data_fim_vis3) &
-            (cal_f['data_fim'].dt.date    >= data_ini_vis3)
-        ]
-        df_sai_rf = calcular_saidas(cal_f, vendas, data_ref, params, ajustes)
-
-        if df_sai_rf.empty:
-            st.warning("Sem dados.")
-        else:
-            st.subheader("Previsão original vs reforecast vs realizado")
-            resumo_rf = (df_sai_rf.groupby(['id_campanha','campanha','categoria'])
-                         .agg(
-                             previsao=('pecas_bruto', lambda x: x[df_sai_rf.loc[x.index,'tipo'].isin(['previsao','reforecast'])].sum() + x[df_sai_rf.loc[x.index,'tipo']=='realizado'].sum()),
-                             realizado=('pecas_bruto', lambda x: x[df_sai_rf.loc[x.index,'tipo']=='realizado'].sum()),
-                             reforecast=('pecas_bruto', lambda x: x[df_sai_rf.loc[x.index,'tipo'].isin(['reforecast','previsao'])].sum()),
-                         ).reset_index())
-
-            # Junta previsão original do calendário
-            prev_orig = cal_f[['id_campanha','previsao_pecas']].copy()
-            resumo_rf = resumo_rf.merge(prev_orig, on='id_campanha', how='left')
-            resumo_rf['desvio_pct'] = ((resumo_rf['realizado'] - resumo_rf['previsao_pecas'])
-                                        / resumo_rf['previsao_pecas'].replace(0, np.nan) * 100).round(1)
-            for c in ['previsao_pecas','realizado','reforecast']:
-                resumo_rf[c] = resumo_rf[c].round(0).astype(int)
-            resumo_rf = resumo_rf.rename(columns={
-                'id_campanha':'ID','campanha':'Campanha','categoria':'Categoria',
-                'previsao_pecas':'Previsão original','realizado':'Realizado',
-                'reforecast':'A realizar','desvio_pct':'Desvio % (real vs prev)'})
-            st.dataframe(resumo_rf, use_container_width=True, hide_index=True)
-
-            st.subheader("Evolução acumulada")
-            acum = (df_sai_rf.sort_values('data')
-                    .assign(data=lambda x: pd.to_datetime(x['data']))
-                    .groupby(['data','tipo'])['pecas_bruto'].sum().reset_index()
-                    .pivot_table(index='data',columns='tipo',values='pecas_bruto',aggfunc='sum')
-                    .fillna(0).cumsum())
-            acum.columns.name = None
-            acum = acum.rename(columns={'realizado':'Realizado','reforecast':'Reforecast','previsao':'Previsão'})
-            st.line_chart(acum, use_container_width=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA SIMULAÇÕES
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_sim:
-    if not cal_ok:
-        st.info("Carregue o calendário na aba Dados.")
-    else:
-        cal = st.session_state['cal']
-        params = get_params()
-        data_ini_vis = params.get('data_ini_vis', date(2025, 5, 1))
-        data_fim_vis = params.get('data_fim_vis', date(2025, 7, 30))
-
-        st.caption("Ajustes aqui são efêmeros — não afetam as bases originais. Use 'Resetar' para voltar ao estado original.")
-
-        if st.button("Resetar todas as simulações"):
-            st.session_state['ajustes'] = {}
-            st.rerun()
-
-        # Filtra campanhas no horizonte de visualização
-        cal_sim = cal[
-            (cal['data_inicio'].dt.date <= data_fim_vis) &
-            (cal['data_fim'].dt.date    >= data_ini_vis)
-        ].copy()
-
-        if cal_sim.empty:
-            st.warning("Nenhuma campanha no período de visualização configurado.")
-        else:
-            camp_nomes = cal_sim.set_index('id_campanha')['campanha'].to_dict()
-            opcoes     = [f"{row['campanha']} (ID {row['id_campanha']})"
-                          for _, row in cal_sim.iterrows()]
-            idx_map    = {f"{row['campanha']} (ID {row['id_campanha']})": row['id_campanha']
-                          for _, row in cal_sim.iterrows()}
-
-            sel_str = st.selectbox("Selecionar campanha para ajustar", opcoes)
-            if sel_str:
-                cid_sel  = idx_map[sel_str]
-                camp_row = cal_sim[cal_sim['id_campanha'] == cid_sel].iloc[0]
-                aj_atual = st.session_state['ajustes'].get(cid_sel, {})
-
-                st.markdown(f"**{camp_row['campanha']}** — {camp_row['categoria']} | CD: {camp_row.get('cd','')}")
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    new_ini = st.date_input("Data início",
-                        value=aj_atual.get('data_inicio', camp_row['data_inicio'].date()),
-                        key=f'ini_{cid_sel}')
-                    new_fim = st.date_input("Data fim",
-                        value=aj_atual.get('data_fim', camp_row['data_fim'].date()),
-                        key=f'fim_{cid_sel}')
-                    new_est = st.number_input("Estoque total (peças)",
-                        value=float(aj_atual.get('estoque_total', camp_row['estoque_total'])),
-                        min_value=0.0, step=100.0, key=f'est_{cid_sel}')
-                with col2:
-                    feriados_sim = get_feriados_set(camp_row.get('cd', 'Extrema'))
-                    dn_calc, do_calc = calcular_datas_blocado(new_ini, new_fim, feriados_sim)
-                    new_dn = st.date_input("Data descida (blocado)",
-                        value=aj_atual.get('dn', dn_calc), key=f'dn_{cid_sel}')
-                    new_do = st.date_input("Data subida (blocado)",
-                        value=aj_atual.get('do', do_calc), key=f'do_{cid_sel}')
-                    new_prev = st.number_input("Previsão de vendas (peças)",
-                        value=float(aj_atual.get('previsao_pecas', camp_row['previsao_pecas'])),
-                        min_value=0.0, step=100.0, key=f'prev_{cid_sel}')
-
-                if st.button("Aplicar ajuste"):
-                    st.session_state['ajustes'][cid_sel] = {
-                        'data_inicio':    new_ini,
-                        'data_fim':       new_fim,
-                        'estoque_total':  new_est,
-                        'dn':             new_dn,
-                        'do':             new_do,
-                        'previsao_pecas': new_prev,
-                    }
-                    st.success(f"Ajuste aplicado para {camp_row['campanha']}. Verifique as abas Saídas e Blocado.")
-
-            if st.session_state['ajustes']:
-                st.subheader("Ajustes ativos")
-                all_nomes = cal.set_index('id_campanha')['campanha'].to_dict()
-                rows = []
-                for cid, aj in st.session_state['ajustes'].items():
-                    rows.append({
-                        'ID':       cid,
-                        'Campanha': all_nomes.get(cid, ''),
-                        'Início':   str(aj.get('data_inicio', '')),
-                        'Fim':      str(aj.get('data_fim', '')),
-                        'Estoque':  aj.get('estoque_total', ''),
-                        'DN':       str(aj.get('dn', '')),
-                        'DO':       str(aj.get('do', '')),
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA PARÂMETROS
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_params:
-    senha = st.text_input("Senha de acesso", type="password", key="senha_params")
-    if senha == "privalia2024":
-        st.success("Acesso liberado.")
-        params = get_params()
-
-        # ── Período de visualização ──────────────────────────────────────────
-        st.subheader("Período de visualização")
-        st.caption("Define o horizonte exibido em todas as abas.")
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            nova_ini = st.date_input("Data inicial", value=params.get('data_ini_vis', date(2025,5,1)),
-                                     key="p_ini")
-        with col_d2:
-            nova_fim = st.date_input("Data final",   value=params.get('data_fim_vis', date(2025,7,30)),
-                                     key="p_fim")
-        params['data_ini_vis'] = nova_ini
-        params['data_fim_vis'] = nova_fim
-
-        st.divider()
-
-        # ── Conversões ───────────────────────────────────────────────────────
-        st.subheader("Conversões por categoria")
-        st.caption("Fator IN = complexidade de recebimento. Fator OUT = complexidade de expedição.")
-        df_conv = st.data_editor(params['conversoes'], use_container_width=True,
-                                 hide_index=True, num_rows="dynamic", key="p_conv")
-        params['conversoes'] = df_conv
-
-        st.divider()
-
-        # ── Pallets ──────────────────────────────────────────────────────────
-        st.subheader("Peças por palete")
-        st.caption("Quantidade de peças que cabem num palete, por categoria.")
-        df_pal = st.data_editor(params['pallets'], use_container_width=True,
-                                hide_index=True, num_rows="dynamic", key="p_pal")
-        params['pallets'] = df_pal
-
-        st.divider()
-
-        # ── Lead times ───────────────────────────────────────────────────────
-        st.subheader("Lead times (dias úteis)")
-        col_wlt, col_dlt = st.columns(2)
-        with col_wlt:
-            wlt = st.number_input("WLT — Warehouse Lead Time", value=params['lead_times']['wlt'],
-                                   min_value=0, max_value=10, step=1, key="p_wlt")
-        with col_dlt:
-            dlt = st.number_input("DLT — Delivery Lead Time",  value=params['lead_times']['dlt'],
-                                   min_value=0, max_value=10, step=1, key="p_dlt")
-        params['lead_times'] = {'wlt': wlt, 'dlt': dlt}
-
-        st.divider()
-
-        # ── Feriados ─────────────────────────────────────────────────────────
-        st.subheader("Feriados")
-        st.caption("Usados no cálculo das datas de descida e subida do blocado.")
-        df_fer = st.data_editor(params['feriados'], use_container_width=True,
-                                hide_index=True, num_rows="dynamic", key="p_fer")
-        params['feriados'] = df_fer
-
-        st.divider()
-
-        # ── Curva de venda ───────────────────────────────────────────────────
-        st.subheader("Curva de venda ODP")
-        st.caption("Percentual de venda por dia relativo, por categoria e webdays. Soma dos dias deve ser 1.")
-        df_curva = st.data_editor(params['curva_venda'], use_container_width=True,
-                                  hide_index=True, num_rows="dynamic", key="p_curva")
-        params['curva_venda'] = df_curva
-
-        st.session_state['params'] = params
-
-    elif senha:
-        st.error("Senha incorreta.")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ABA EXPORTAR
-# ═══════════════════════════════════════════════════════════════════════════════
-with aba_export:
-    st.subheader("Exportar resultados")
-    st.caption("Exporta o estado atual da simulação. Nada é salvo no sistema.")
-
-    if not cal_ok:
-        st.info("Carregue os dados primeiro.")
-    else:
-        cal = st.session_state['cal']
-        vendas = None
-        if arq_vend is not None:
-            try: vendas = carregar_vendas(arq_vend)
-            except: pass
-
-        cal_f = filtrar_cd(cal)
-        df_sai_exp = calcular_saidas(cal_f, vendas, data_ref, params, ajustes)
-        df_bloc_exp, serie_bloc_exp = calcular_blocado(cal_f, data_ref, params, ajustes)
-
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-            if not df_sai_exp.empty:
-                pivot_exp = (df_sai_exp.groupby(['data','tipo'])['pecas_bruto'].sum().reset_index()
-                             .pivot_table(index='data',columns='tipo',values='pecas_bruto',aggfunc='sum')
-                             .fillna(0).sort_index())
-                pivot_exp.columns.name = None
-                pivot_exp.to_excel(writer, sheet_name='Saídas — dia a dia')
-                df_sai_exp.to_excel(writer, sheet_name='Saídas — detalhe', index=False)
-            if not df_bloc_exp.empty:
-                df_bloc_exp.to_excel(writer, sheet_name='Blocado — campanhas', index=False)
-            if not serie_bloc_exp.empty:
-                serie_bloc_exp.to_excel(writer, sheet_name='Blocado — série', index=False)
-            cal_f.to_excel(writer, sheet_name='Calendário ODP', index=False)
-
-        st.download_button(
-            "Baixar Excel",
-            data=buf.getvalue(),
-            file_name=f"simulador_odp_{date.today().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        header_html = (
+            f'<span class="{badge}">{camp["status"]}</span> &nbsp;'
+            f'<b>{camp["campanha"]}</b> &nbsp;'
+            f'<span style="color:#9ca3af;font-size:12px">'
+            f'{camp["cat"]} · {camp["cd"]} · '
+            f'{camp["sd"].strftime("%d/%m")} → {camp["ed"].strftime("%d/%m")} · '
+            f'dia {camp["dia_atual"]} de {camp["wd"]}'
+            f'</span> &nbsp; {alerta_str}'
         )
+
+        with st.expander(camp['campanha'], expanded=False):
+            st.markdown(header_html, unsafe_allow_html=True)
+            c1,c2,c3,c4,c5,c6 = st.columns(6)
+            c1.metric("Estoque",    fmt_n(camp['estoque']))
+            c2.metric("Pallets",    fmt_n(camp['pallets']))
+            c3.metric("Forecast",   fmt_n(camp['forecast']))
+            c4.metric("SO congel.", fmt_pct(camp['so_cong']))
+            c5.metric("Venda real", fmt_n(camp['venda_real']))
+            c6.metric("SO real",    fmt_pct(camp['so_real_acum']))
+
+            c7,c8,c9,c10 = st.columns(4)
+            c7.metric("Reforecast", fmt_n(camp['reforecast']))
+            c8.metric("Novo SO",    fmt_pct(camp['novo_so']))
+            c9.metric("Descida DN", camp['dn'].strftime('%d/%m/%Y'))
+            c10.metric("Subida DO", camp['do_'].strftime('%d/%m/%Y'))
+
+            # barra de progresso
+            prog = camp['dia_atual'] / camp['wd'] if camp['wd'] > 0 else 0
+            st.progress(float(prog), text=f"Progresso: dia {camp['dia_atual']} / {camp['wd']}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ABA 2 — SAÍDAS
+# ═════════════════════════════════════════════════════════════════════════════
+with aba_saidas:
+    # ── Filtros ───────────────────────────────────────────────────────────────
+    fc1, fc2, fc3, fc4 = st.columns([2,2,2,2])
+    with fc1:
+        opcoes_cd  = ['Todos'] + sorted(df['cd'].unique().tolist())
+        sel_cd     = st.selectbox("CD", opcoes_cd, key='sai_cd')
+    with fc2:
+        opcoes_cat = ['Todas'] + sorted(df['cat'].unique().tolist())
+        sel_cat    = st.selectbox("Categoria", opcoes_cat, key='sai_cat')
+    with fc3:
+        unidade    = st.radio("Unidade", ["Convertido","Bruto"], horizontal=True, key='sai_uni')
+    with fc4:
+        dt_range   = st.date_input("Período",
+                     value=(data_ref - timedelta(days=7), data_ref + timedelta(days=30)),
+                     key='sai_per')
+
+    df_sai_base = df.copy()
+    if sel_cd  != 'Todos':  df_sai_base = df_sai_base[df_sai_base['cd'] == sel_cd]
+    if sel_cat != 'Todas':  df_sai_base = df_sai_base[df_sai_base['cat'] == sel_cat]
+
+    dt_ini_s = dt_range[0] if len(dt_range) == 2 else data_ref - timedelta(days=7)
+    dt_fim_s = dt_range[1] if len(dt_range) == 2 else data_ref + timedelta(days=30)
+
+    # gera série — usa curva simplificada (uniforme)
+    with st.spinner("Calculando saídas..."):
+        uni_str = 'convertido' if unidade == 'Convertido' else 'bruto'
+        serie_sai = gerar_serie_saidas(df_sai_base, dt_ini_s, dt_fim_s, uni_str)
+
+    if not serie_sai.empty:
+        # agrega por data e tipo
+        pivot = (serie_sai.groupby(['data','tipo'])['volume']
+                 .sum().unstack(fill_value=0).reset_index())
+        for t in ['realizado','reforecast','previsto']:
+            if t not in pivot.columns:
+                pivot[t] = 0
+
+        fig_sai = go.Figure()
+        for tipo, cor, label in [
+            ('realizado',  CORES_TIPO['realizado'],  'Realizado'),
+            ('reforecast', CORES_TIPO['reforecast'], 'Reforecast'),
+            ('previsto',   CORES_TIPO['previsto'],   'Previsto'),
+        ]:
+            fig_sai.add_bar(x=pivot['data'], y=pivot[tipo],
+                            name=label, marker_color=cor)
+
+        fig_sai.update_layout(
+            barmode='stack', height=320,
+            margin=dict(l=0,r=0,t=10,b=0),
+            legend=dict(orientation='h', y=1.08),
+            xaxis=dict(showgrid=False),
+            yaxis=dict(title=f"Peças ({unidade.lower()})", gridcolor='#f3f4f6'),
+            plot_bgcolor='white', paper_bgcolor='white',
+            font=dict(family='DM Sans', size=12),
+        )
+        # linha de capacidade check-out
+        cap_val = CAP_CHECKOUT if uni_str == 'convertido' else CAP_CHECKIN
+        fig_sai.add_hline(y=cap_val, line_dash='dot', line_color='#dc2626',
+                          annotation_text=f"Cap. {cap_val:,.0f}", annotation_font_size=11)
+        st.plotly_chart(fig_sai, use_container_width=True)
+
+    # ── Tabela por campanha ───────────────────────────────────────────────────
+    st.markdown('<div class="titulo-sec">Detalhe por campanha</div>', unsafe_allow_html=True)
+    for _, camp in df_sai_base.sort_values('sd').iterrows():
+        with st.expander(f"{camp['campanha']} · {camp['cat']} · {camp['sd'].strftime('%d/%m')}→{camp['ed'].strftime('%d/%m')}"):
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Reforecast total", fmt_n(camp['reforecast']))
+            c2.metric("Fat. OUT",         f"{camp['fat_out']:.2f}×")
+            c3.metric("Curva usada",      f"{camp['cat']} {camp['wd']}wd")
+            c4.metric("Dias restantes",   fmt_n(camp['dias_rest']))
+
+            # mini série desta campanha
+            s_camp = serie_sai[serie_sai['id'] == camp['id']]
+            if not s_camp.empty:
+                s_p = s_camp.groupby(['data','tipo'])['volume'].sum().unstack(fill_value=0).reset_index()
+                for t in ['realizado','reforecast','previsto']:
+                    if t not in s_p.columns: s_p[t] = 0
+                fig_c = go.Figure()
+                for tipo, cor in [('realizado','#1e3a5f'),('reforecast','#3b82f6'),('previsto','#bfdbfe')]:
+                    fig_c.add_bar(x=s_p['data'], y=s_p[tipo], name=tipo, marker_color=cor)
+                fig_c.update_layout(barmode='stack', height=180,
+                                    margin=dict(l=0,r=0,t=5,b=0),
+                                    showlegend=False, plot_bgcolor='white',
+                                    paper_bgcolor='white',
+                                    xaxis=dict(showgrid=False),
+                                    yaxis=dict(gridcolor='#f3f4f6'))
+                st.plotly_chart(fig_c, use_container_width=True)
+
+    # ── Exportar ──────────────────────────────────────────────────────────────
+    if not serie_sai.empty:
+        csv = (serie_sai.groupby(['data','campanha','cat','cd','tipo'])['volume']
+               .sum().reset_index().to_csv(index=False, sep=';').encode('utf-8-sig'))
+        st.download_button("⬇ Exportar tabela de saídas (.csv)", csv,
+                           "saidas_odp.csv", "text/csv")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ABA 3 — BLOCADO
+# ═════════════════════════════════════════════════════════════════════════════
+with aba_blocado:
+    # ── Filtros ───────────────────────────────────────────────────────────────
+    fb1, fb2, fb3 = st.columns([2,2,3])
+    with fb1:
+        sel_cd_b = st.selectbox("CD", ['Todos'] + sorted(df['cd'].unique().tolist()), key='bl_cd')
+    with fb2:
+        uni_b = st.radio("Unidade", ["Pallets","Peças brutas","Peças conv."], horizontal=True, key='bl_uni')
+    with fb3:
+        dt_range_b = st.date_input("Período",
+                     value=(data_ref - timedelta(days=7), data_ref + timedelta(days=45)),
+                     key='bl_per')
+
+    df_bl = df.copy()
+    if sel_cd_b != 'Todos':
+        df_bl = df_bl[df_bl['cd'] == sel_cd_b]
+
+    dt_ini_b = dt_range_b[0] if len(dt_range_b) == 2 else data_ref - timedelta(days=7)
+    dt_fim_b = dt_range_b[1] if len(dt_range_b) == 2 else data_ref + timedelta(days=45)
+
+    # série de blocado
+    with st.spinner("Calculando blocado..."):
+        serie_bl = gerar_serie_blocado(df_bl, dt_ini_b, dt_fim_b)
+
+    if uni_b == "Peças brutas":
+        col_vol = 'pcs_brutas'
+        # recalcular com peças brutas (pallets * pcs_pal por campanha)
+        rows_bl2 = []
+        datas_bl = pd.date_range(dt_ini_b, dt_fim_b, freq='D')
+        for dt in datas_bl:
+            dt_d = dt.date()
+            ativas = df_bl[(df_bl['dn'].dt.date <= dt_d) & (df_bl['do_'].dt.date >= dt_d)]
+            rows_bl2.append({'data': dt, 'vol': ativas['estoque'].sum()})
+        serie_plot = pd.DataFrame(rows_bl2)
+        cap_linha  = None
+        ytitle     = "Peças brutas"
+    elif uni_b == "Peças conv.":
+        rows_bl3 = []
+        datas_bl = pd.date_range(dt_ini_b, dt_fim_b, freq='D')
+        for dt in datas_bl:
+            dt_d = dt.date()
+            ativas = df_bl[(df_bl['dn'].dt.date <= dt_d) & (df_bl['do_'].dt.date >= dt_d)]
+            vol = (ativas['estoque'] / ativas['fat_in'].replace(0,1)).sum()
+            rows_bl3.append({'data': dt, 'vol': vol})
+        serie_plot = pd.DataFrame(rows_bl3)
+        cap_linha  = CAP_CHECKOUT
+        ytitle     = "Peças convertidas"
+    else:
+        serie_plot = serie_bl.rename(columns={'pallets':'vol'})
+        cap_linha  = CAP_BU
+        ytitle     = "Pallets"
+
+    if not serie_plot.empty:
+        fig_bl = go.Figure()
+        fig_bl.add_scatter(x=serie_plot['data'], y=serie_plot['vol'],
+                           fill='tozeroy', fillcolor='rgba(59,130,246,0.15)',
+                           line=dict(color='#3b82f6', width=2),
+                           name=ytitle, hovertemplate='%{x|%d/%m}<br>%{y:,.0f}<extra></extra>')
+        if cap_linha:
+            fig_bl.add_hline(y=cap_linha, line_dash='dot', line_color='#dc2626',
+                             annotation_text=f"Cap. {cap_linha:,}", annotation_font_size=11)
+        fig_bl.update_layout(
+            height=320, margin=dict(l=0,r=0,t=10,b=0),
+            xaxis=dict(showgrid=False),
+            yaxis=dict(title=ytitle, gridcolor='#f3f4f6'),
+            plot_bgcolor='white', paper_bgcolor='white',
+            font=dict(family='DM Sans', size=12),
+        )
+        st.plotly_chart(fig_bl, use_container_width=True)
+
+    # ── Métricas ──────────────────────────────────────────────────────────────
+    pico_pal = serie_bl['pallets'].max() if not serie_bl.empty else 0
+    desc_sem = df_bl[(df_bl['dn'].dt.date >= data_ref) &
+                     (df_bl['dn'].dt.date <= data_ref + timedelta(days=7))]
+    sub_sem  = df_bl[(df_bl['do_'].dt.date >= data_ref) &
+                     (df_bl['do_'].dt.date <= data_ref + timedelta(days=7))]
+    mb1,mb2,mb3 = st.columns(3)
+    mb1.metric("Pico próx. 45 dias", fmt_n(pico_pal) + " pal",
+               delta=f"{pico_pal/CAP_BU*100:.0f}% da cap. BU", delta_color="off")
+    mb2.metric("Descidas esta semana", len(desc_sem),
+               delta="campanhas entram no picking")
+    mb3.metric("Subidas esta semana",  len(sub_sem),
+               delta="campanhas saem do picking")
+
+    # ── Tabela por campanha ───────────────────────────────────────────────────
+    st.markdown('<div class="titulo-sec">Detalhe por campanha</div>', unsafe_allow_html=True)
+    df_bl_sort = df_bl.sort_values('dn')
+    for _, camp in df_bl_sort.iterrows():
+        status_badge = {'ON':'🟢','x':'⚪','-':'🔵'}.get(camp['status'],'')
+        with st.expander(f"{status_badge} {camp['campanha']} · {camp['cat']} · DN {camp['dn'].strftime('%d/%m')} → DO {camp['do_'].strftime('%d/%m')}"):
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("Pallets",    fmt_n(camp['pallets']))
+            c2.metric("Pç brutas",  fmt_n(camp['estoque']))
+            c3.metric("Pç/palete",  fmt_n(camp['pcs_pal']))
+            c4.metric("Fat. IN",    f"{camp['fat_in']:.2f}×")
+            c5.metric("CD",         camp['cd'])
+
+    # ── Exportar ──────────────────────────────────────────────────────────────
+    exp_bl = df_bl[['id','campanha','cat','setor','cd','status','sd','ed','dn','do_',
+                     'estoque','pallets','pcs_pal','fat_in','fat_out']].copy()
+    exp_bl.columns = ['ID','Campanha','Categoria','Setor','CD','Status',
+                       'SD','ED','DN','DO','Estoque','Pallets','Pcs/Pal','Fat IN','Fat OUT']
+    csv_bl = exp_bl.to_csv(index=False, sep=';').encode('utf-8-sig')
+    st.download_button("⬇ Exportar tabela de blocado (.csv)", csv_bl,
+                       "blocado_odp.csv", "text/csv")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ABA 4 — REFORECAST
+# ═════════════════════════════════════════════════════════════════════════════
+with aba_rfcst:
+    # ── Filtros ───────────────────────────────────────────────────────────────
+    fr1, fr2, fr3 = st.columns([2,2,2])
+    with fr1:
+        mostrar_rf = st.radio("Campanhas", ["Só ativas (ON)","Todas"], horizontal=True, key='rf_show')
+    with fr2:
+        so_alerta_rf = st.radio("Filtro", ["Todas","Só com desvio >15 p.p."], horizontal=True, key='rf_fil')
+    with fr3:
+        sel_cd_rf = st.selectbox("CD", ['Todos'] + sorted(df['cd'].unique().tolist()), key='rf_cd')
+
+    df_rf = df.copy()
+    if mostrar_rf == "Só ativas (ON)":
+        df_rf = df_rf[df_rf['status'] == 'ON']
+    if so_alerta_rf == "Só com desvio >15 p.p.":
+        df_rf = df_rf[df_rf['desvio_abs'].abs() > 0.15]
+    if sel_cd_rf != 'Todos':
+        df_rf = df_rf[df_rf['cd'] == sel_cd_rf]
+
+    df_rf = df_rf.sort_values('desvio_abs', key=abs, ascending=False)
+
+    st.markdown('<div class="titulo-sec">Racional de reforecast por campanha</div>',
+                unsafe_allow_html=True)
+
+    for _, camp in df_rf.iterrows():
+        desvio_cor = cor_desvio(camp['desvio_abs'])
+        sinal = "+" if camp['desvio_abs'] >= 0 else ""
+        status_str = {'ON':'🟢','x':'⚪','-':'🔵'}.get(camp['status'],'')
+        badge_dev = (f'<span style="color:{desvio_cor};font-weight:600">'
+                     f'{sinal}{camp["desvio_abs"]*100:.1f} p.p.</span>')
+
+        with st.expander(
+            f"{status_str} {camp['campanha']}  ·  "
+            f"dia {camp['dia_atual']}/{camp['wd']}  ·  "
+            f"desvio {sinal}{camp['desvio_abs']*100:.1f} p.p."
+        ):
+            # barra dupla: previsto vs real
+            prog_prev = float(min(1, camp['so_prev_acum']))
+            prog_real = float(min(1, camp['so_real_acum']))
+
+            st.markdown(f"""
+            <div style='margin-bottom:12px'>
+              <div style='display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin-bottom:4px'>
+                <span>SO previsto acum.</span><span>{prog_prev*100:.1f}%</span>
+              </div>
+              <div style='background:#f3f4f6;border-radius:4px;height:8px'>
+                <div style='width:{prog_prev*100:.1f}%;background:#93c5fd;border-radius:4px;height:100%'></div>
+              </div>
+              <div style='display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin:8px 0 4px'>
+                <span>SO real acum.</span>
+                <span style='color:{desvio_cor};font-weight:600'>{prog_real*100:.1f}% ({sinal}{camp["desvio_abs"]*100:.1f} p.p.)</span>
+              </div>
+              <div style='background:#f3f4f6;border-radius:4px;height:8px'>
+                <div style='width:{prog_real*100:.1f}%;background:{desvio_cor};border-radius:4px;height:100%'></div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            c1,c2,c3,c4,c5,c6 = st.columns(6)
+            c1.metric("Venda real",   fmt_n(camp['venda_real']))
+            c2.metric("Reforecast",   fmt_n(camp['reforecast']))
+            c3.metric("Var vs FC",    fmt_pct(camp['mudanca_vs_fc']))
+            c4.metric("Novo SO",      fmt_pct(camp['novo_so']))
+            c5.metric("SO congel.",   fmt_pct(camp['so_cong']))
+            c6.metric("Fator ajuste", f"{camp['fator_ajuste']:.2f}×")
+
+            # funil QB→QR
+            st.markdown("**Racional completo (QB → QR)**")
+            tb = {
+                "QB · Dias de venda":                 camp['dias_venda'],
+                "QC · Dias restantes":                camp['dias_rest'],
+                "QD · Proj. acumulada até D-1":       fmt_pct(camp['proj_acum']),
+                "QE · SO previsto acum.":             fmt_pct(camp['so_prev_acum']),
+                "QF · Venda real acum.":              fmt_n(camp['venda_real']),
+                "QG · SO real acum.":                 fmt_pct(camp['so_real_acum']),
+                "QH · Desvio abs (SO real–prev)":     f"{camp['desvio_abs']*100:+.2f} p.p.",
+                "QI · Desvio rel (SO real/prev – 1)": fmt_pct(camp['desvio_rel']),
+                "QJ · Desvio médio":                  fmt_pct((camp['desvio_abs']+camp['desvio_rel'])/2),
+                "QK · Fator de ajuste (1+QJ)":        f"{camp['fator_ajuste']:.3f}×",
+                "QL · % restante da curva":           fmt_pct(1-camp['proj_acum']),
+                "QO · Reforecast final":              fmt_n(camp['reforecast']),
+                "QP · Var vs Forecast congelado":     fmt_pct(camp['mudanca_vs_fc']),
+                "QQ · Novo Sell-out (estoque)":       fmt_pct(camp['novo_so']),
+                "QR · Var vs SO original":            f"{camp['desvio_vs_so']*100:+.2f} p.p.",
+            }
+            st.table(pd.DataFrame.from_dict(tb, orient='index', columns=['Valor']))
+
+    # ── Exportar ──────────────────────────────────────────────────────────────
+    cols_exp = ['id','campanha','cat','cd','status','sd','ed','wd',
+                'estoque','forecast','so_cong','venda_real','so_real_acum',
+                'desvio_abs','fator_ajuste','reforecast','novo_so','mudanca_vs_fc']
+    exp_rf = df_rf[cols_exp].copy()
+    exp_rf.columns = ['ID','Campanha','Categoria','CD','Status','SD','ED','WD',
+                       'Estoque','Forecast','SO Congel.','Venda Real','SO Real',
+                       'Desvio (p.p.)','Fator Ajuste','Reforecast','Novo SO','Var vs FC']
+    csv_rf = exp_rf.to_csv(index=False, sep=';').encode('utf-8-sig')
+    st.download_button("⬇ Exportar tabela de reforecast (.csv)", csv_rf,
+                       "reforecast_odp.csv", "text/csv")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ABA 5 — DADOS
+# ═════════════════════════════════════════════════════════════════════════════
+with aba_dados:
+    st.markdown("#### Upload do Simulador ODP")
+    st.markdown("""
+    <div style='border:1.5px dashed #d1d5db;border-radius:12px;padding:24px;
+                text-align:center;color:#6b7280;font-size:13px;margin-bottom:20px'>
+        Use o botão de upload no topo da página para carregar o arquivo <b>.xlsm</b>.<br>
+        <span style='font-size:11px'>O arquivo permanece apenas na sessão — não é armazenado.</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if df is not None and not df.empty:
+        st.markdown("#### Arquivo carregado")
+        cdi1,cdi2,cdi3 = st.columns(3)
+        cdi1.metric("Total campanhas ODP", len(df))
+        cdi2.metric("Campanhas ON",  len(df_on))
+        cdi3.metric("Data referência", data_ref.strftime('%d/%m/%Y'))
+
+        st.markdown('<div class="titulo-sec">Resumo por status</div>', unsafe_allow_html=True)
+        resumo = (df.groupby('status')
+                  .agg(campanhas=('id','count'),
+                       estoque_total=('estoque','sum'),
+                       pallets_total=('pallets','sum'))
+                  .reset_index()
+                  .rename(columns={'status':'Status','campanhas':'Campanhas',
+                                   'estoque_total':'Estoque Total','pallets_total':'Pallets Total'}))
+        st.dataframe(resumo, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="titulo-sec">Tabela completa de campanhas</div>', unsafe_allow_html=True)
+        cols_vis = ['id','campanha','status','cat','cd','sd','ed','wd',
+                    'estoque','pallets','forecast','so_cong','reforecast','novo_so']
+        df_vis = df[cols_vis].copy()
+        df_vis.columns = ['ID','Campanha','Status','Categoria','CD','SD','ED','WD',
+                           'Estoque','Pallets','Forecast','SO Congel.','Reforecast','Novo SO']
+        st.dataframe(df_vis, use_container_width=True, hide_index=True)
+
+        csv_all = df_vis.to_csv(index=False, sep=';').encode('utf-8-sig')
+        st.download_button("⬇ Exportar todas as campanhas (.csv)", csv_all,
+                           "campanhas_odp.csv", "text/csv")
